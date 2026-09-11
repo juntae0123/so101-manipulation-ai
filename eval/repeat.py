@@ -141,6 +141,7 @@ def run_conditions(args: Any, train_seeds: list[int] | None = None) -> dict[str,
         "policy_device": getattr(args, "policy_device", "cpu"),
         # 행동공간 덮어쓰기. train_config_sha 는 파일 해시라 이걸 반영하지 못한다.
         "action_space_override": getattr(args, "action_space", None),
+        "cameras_override": getattr(args, "cameras", None),
         "train_config_sha": file_digest(DEFAULT_TRAIN_CONFIG),
         "gate": {"rollout": ROLLOUT_GATE, "min_runs": GATE_MIN_RUNS},
     }
@@ -164,6 +165,7 @@ def repeat(
     image_noise: float | None = None,
     policy_device: str = "cpu",
     action_space: str | None = None,
+    cameras: str | None = None,
 ) -> list[RunResult]:
     """Train `runs` times, score each, and collect the results.
     `runs` 회 학습하고 각각 채점해 결과를 모은다."""
@@ -186,6 +188,10 @@ def repeat(
             train_cmd += ["--image-noise", str(image_noise)]
         if action_space is not None:
             train_cmd += ["--action-space", action_space]
+        # 카메라 부분집합. 실물 배포 구성(손목 1대)을 재수집 없이 학습하기 위한 것이다.
+        # L76 참조. 평가 환경은 여전히 2대를 렌더하고 정책이 필요한 것만 읽는다.
+        if cameras is not None:
+            train_cmd += ["--cameras", cameras]
         _run(train_cmd)
         # `--policy-device` 를 자식에게 넘긴다. 안 넘기면 repeat_runs 의 conditions 에는
         # 기록되는데 실제 평가는 eval_rollout 기본값으로 돌아 **기록과 실행이 갈린다.**
@@ -288,6 +294,10 @@ def main() -> int:
         "--action-space", type=str, default=None,
         help="model.action_space 를 덮어쓴다 (자식 train_bc 로 전달)",
     )
+    parser.add_argument(
+        "--cameras", type=str, default=None,
+        help="쉼표로 구분한 카메라 부분집합 (자식 train_bc 로 전달). 예: cam_wrist",
+    )
     parser.add_argument("--log", action="store_true")
     args = parser.parse_args()
 
@@ -328,6 +338,7 @@ def main() -> int:
         image_noise=args.image_noise,
         policy_device=args.policy_device,
         action_space=args.action_space,
+        cameras=args.cameras,
     )
     summary = summarise(results)
 

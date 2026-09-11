@@ -73,7 +73,16 @@ class EpisodeDataset(Dataset):
         self.index: list[tuple[int, int]] = []   # (episode idx, timestep)
         self.episodes: list[Any] = []
         self.rejected: list[tuple[str, list[str]]] = []
-        cams: list[str] | None = camera_names
+
+        # `camera_names` 는 **부분집합 선택**이다 (2026-09-11).
+        # 근거 🔵: 실물 카메라는 UMI 그리퍼 1대 + 로봇팔 1대이고 같은 각도다.
+        # 추론 시점에 살아 있는 것은 로봇팔 1대뿐이라 3인칭(`cam_front`) 에 대응물이
+        # 없다 (L62 해소 · L76). 이미 수집된 2대짜리 에피소드를 재수집 없이
+        # 손목 전용으로 학습하려면 여기서 고를 수 있어야 한다.
+        # 에피소드끼리의 카메라 일치 검사는 `ep_cams` 로 그대로 유지한다 —
+        # 부분집합 허용이 그 검사를 무르게 만들지 않는다.
+        requested: list[str] | None = list(camera_names) if camera_names else None
+        ep_cams: list[str] | None = None
 
         for ep_path in files:
             ep = read_episode(ep_path)
@@ -86,20 +95,27 @@ class EpisodeDataset(Dataset):
                         + "\n  ".join(problems)
                     )
                 continue
-            if cams is None:
-                cams = list(ep.meta.cameras)
-            elif list(ep.meta.cameras) != cams:
+            if ep_cams is None:
+                ep_cams = list(ep.meta.cameras)
+            elif list(ep.meta.cameras) != ep_cams:
                 raise ValueError(
                     f"{ep_path.name} 의 카메라 {ep.meta.cameras} 가 "
-                    f"앞선 에피소드의 {cams} 와 다르다"
+                    f"앞선 에피소드의 {ep_cams} 와 다르다"
                 )
+            if requested is not None:
+                missing = [c for c in requested if c not in ep.meta.cameras]
+                if missing:
+                    raise ValueError(
+                        f"{ep_path.name} 에 요청한 카메라 {missing} 가 없다 "
+                        f"(있는 것: {list(ep.meta.cameras)})"
+                    )
             i = len(self.episodes)
             self.episodes.append(ep)
             self.index.extend((i, t) for t in range(ep.meta.n_steps))
 
-        if cams is None or not self.index:
+        if ep_cams is None or not self.index:
             raise ValueError(f"쓸 수 있는 에피소드가 없다: {self.root}")
-        self.camera_names = cams
+        self.camera_names = requested if requested is not None else ep_cams
 
     def __len__(self) -> int:
         return len(self.index)

@@ -32,6 +32,7 @@ episodes: 100
 seed_base: 0
 eval_seed_base: 3000
 action_space: joint_delta_gripper_binary   # 생략하면 configs/train/bc.yaml 값
+cameras: cam_wrist               # 생략하면 데이터셋의 카메라 전부. 부분집합만 허용
 device: cuda
 policy_device: cpu
 ```
@@ -43,6 +44,7 @@ policy_device: cpu
 | 사전등록 문서 없음·200바이트 미만 | 사전등록 없는 실험은 결과를 사후에 해석하게 된다 |
 | 추적 중인 변경이 남아 있음 | 결과의 `code_sha` 가 실제 실행 코드를 안 가리킨다 |
 | 모르는 `action_space` | 오타를 밤새 돌린 뒤에 알면 하룻밤이 날아간다 |
+| `cam_` 으로 시작하지 않는 `cameras` 항목 | 같은 이유. 실제 존재 여부는 첫 에피소드에서 막힌다 |
 | `name` ≠ 파일명 | 체크포인트 덮어쓰기 사고를 막는다 (2026-09-07 에 완주 실험을 잃었다) |
 
 **하나라도 막히면 아무것도 시작하지 않는다.** 반쯤 돌다 멈추면 어느 조건이 어느

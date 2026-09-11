@@ -111,6 +111,17 @@ def validate(item: dict, path: Path) -> list[str]:
                     f"action_space 를 모른다: {space!r} (지원: {ACTION_SPACES})"
                 )
 
+    # 카메라 이름 오타도 밤새 돌린 뒤에 알면 하룻밤이 날아간다.
+    # 여기서는 형식만 본다 — 실제 존재 여부는 EpisodeDataset 이 첫 에피소드에서 막는다.
+    cams = item.get("cameras")
+    if cams is not None:
+        names = [c.strip() for c in str(cams).split(",") if c.strip()]
+        if not names:
+            bad.append(f"cameras 가 비었다: {cams!r}")
+        unknown = [c for c in names if not c.startswith("cam_")]
+        if unknown:
+            bad.append(f"카메라 이름이 'cam_' 으로 시작하지 않는다: {unknown}")
+
     return bad
 
 
@@ -133,6 +144,8 @@ def build_cmd(item: dict) -> list[str]:
         cmd += ["--epochs", str(item["epochs"])]
     if item.get("action_space"):
         cmd += ["--action-space", str(item["action_space"])]
+    if item.get("cameras"):
+        cmd += ["--cameras", str(item["cameras"])]
     if item.get("image_noise") is not None:
         cmd += ["--image-noise", str(item["image_noise"])]
     return cmd

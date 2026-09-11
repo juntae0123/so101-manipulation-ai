@@ -297,6 +297,11 @@ def main() -> int:
              "EXP_LOG conditions.action_space 에 실제 사용값이 기록된다. "
              "⚠️ train_config_sha 는 파일 해시라 이 덮어쓰기를 반영하지 않는다",
     )
+    parser.add_argument(
+        "--cameras", type=str, default=None,
+        help="쉼표로 구분한 카메라 이름. 데이터셋 카메라의 **부분집합**만 쓴다. "
+             "예: --cameras cam_wrist (실물 배포 구성. L76)",
+    )
     parser.add_argument("--log", action="store_true")
     args = parser.parse_args()
 
@@ -313,15 +318,24 @@ def main() -> int:
     device = torch.device(args.device)
 
     if args.random is not None:
-        dataset: Any = RandomTensorDataset(args.random, cfg, DEFAULT_CAMERAS, seed=seed)
-        cameras = DEFAULT_CAMERAS
+        cameras = (
+            [c.strip() for c in args.cameras.split(",") if c.strip()]
+            if args.cameras else DEFAULT_CAMERAS
+        )
+        dataset: Any = RandomTensorDataset(args.random, cfg, cameras, seed=seed)
         trained_on = "random_tensors"
         n_episodes = 0
         print("⚠️ 랜덤 텐서로 학습한다. **손실 값에 의미가 없다.**")
         print("   확인하는 것은 루프가 끝까지 도는가 하나뿐이다.\n")
     else:
-        dataset = EpisodeDataset(args.data, cfg)
+        cam_override = (
+            [c.strip() for c in args.cameras.split(",") if c.strip()]
+            if args.cameras else None
+        )
+        dataset = EpisodeDataset(args.data, cfg, camera_names=cam_override)
         cameras = dataset.camera_names
+        if cam_override is not None:
+            print(f"· 카메라 덮어쓰기: {cameras} (데이터셋은 건드리지 않았다)")
         trained_on = str(args.data)
         n_episodes = len(dataset.episodes)
 

@@ -1,0 +1,16 @@
+# 손목 전용(카메라 1대) 재학습 — 실물 배포 구성
+# 사전등록: docs/PREREG_wrist_only_0911.md
+# 대조군은 재학습하지 않는다. 이미 있는 gripper_binary_dagger seed0/1/2 (6/69/25) 다.
+name: wrist_only_dagger
+prereg: docs/PREREG_wrist_only_0911.md
+kind: repeat_runs
+data: out/dagger_merged_20260910_092947
+cameras: cam_wrist            # ← 이 항목만 대조군과 다르다
+runs: 3
+epochs: 30
+episodes: 100
+seed_base: 0
+eval_seed_base: 3000
+action_space: joint_delta_gripper_binary
+device: cuda
+policy_device: cpu

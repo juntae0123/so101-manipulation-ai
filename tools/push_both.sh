@@ -57,6 +57,32 @@ echo "=============================================="
 git branch -D "${MIRROR_LOCAL}" >/dev/null 2>&1 || true
 git subtree split --prefix=AI -b "${MIRROR_LOCAL}" -q
 echo "AI/ 커밋 $(git rev-list --count "${MIRROR_LOCAL}") 개"
+
+# Strip assistant trailers from the mirror's messages (2026-09-11).
+# 미러 메시지에서 어시스턴트 서명 줄을 지운다.
+#
+# 팀 GitLab 쪽은 못 지운다 — 공유 브랜치이고 65커밋이 이미 dev 에 머지됐다.
+# 미러는 다르다: 매번 subtree split 으로 **다시 만들어** force push 하므로
+# 여기서 지우면 과거 커밋까지 전부 깨끗해지고, 다음 push 에서도 그대로 유지된다.
+# 조율 비용 0. `claude/규칙_커밋_서명금지.md`
+#
+# 던지는 대상은 throwaway 브랜치 ai-standalone 뿐이다. ai 는 건드리지 않는다.
+echo "· 미러 메시지에서 어시스턴트 서명 줄 제거"
+git update-ref -d "refs/original/refs/heads/${MIRROR_LOCAL}" 2>/dev/null || true
+FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f \
+  --msg-filter "sed -E '/^Co-Authored-By: Claude/d; /^Claude-Session:/d; /Generated with \[Claude Code\]/d'" \
+  -- "${MIRROR_LOCAL}" >/dev/null
+git update-ref -d "refs/original/refs/heads/${MIRROR_LOCAL}" 2>/dev/null || true
+rm -rf "$(git rev-parse --git-dir)/refs/original" 2>/dev/null || true
+
+LEFT="$(git log "${MIRROR_LOCAL}" --format='%h' \
+  --grep='Co-Authored-By: Claude' --grep='Claude-Session:' -i -- | wc -l | tr -d ' ')"
+if [ "${LEFT}" != "0" ]; then
+  echo "✗ 미러에 서명이 남은 커밋 ${LEFT}건. push 하지 않는다."
+  exit 1
+fi
+echo "  남은 서명 커밋 0건 확인"
+
 git push gh "${MIRROR_LOCAL}:${MIRROR_REMOTE}" --force
 
 echo

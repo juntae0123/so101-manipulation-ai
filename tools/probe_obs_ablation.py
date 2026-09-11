@@ -153,14 +153,30 @@ def cache_donor(env: MujocoPickEnv, policy: BCPolicy, seed: int) -> list[dict[st
     return frames
 
 
-def verdict(drop_pp: float) -> str:
-    """Pre-registered read of the donor_both drop.
-    `donor_both` 하락폭에 대한 사전등록 판정."""
-    if drop_pp < 20.0:
-        return "images_barely_used__bottleneck_is_observation_not_precision"
-    if drop_pp < 50.0:
+def verdict(drop_pp: float, base_rate: float, near_ratio: float) -> str:
+    """Pre-registered read of the donor_both drop, guarded against a floor effect.
+    `donor_both` 하락폭에 대한 사전등록 판정. 바닥 효과를 막는다.
+
+    **정정 (2026-09-11, 실행 후).** 초판은 절대 하락폭만 봤다. 원래 성공률이 낮은
+    체크포인트는 **떨어질 자리가 없어서** 하락폭이 작게 나오고, 실제로는 100% 를
+    잃었는데도 "이미지를 안 쓴다"로 찍혔다 — seed0(6/100)에서 그렇게 오판했다.
+    사전등록 예측 4번에 "바닥 효과 때문에 절대 %p 로 읽는다"고 적어놓고 함수에
+    반영하지 못한 것이 원인이다.
+
+    이제 세 가지를 함께 본다:
+      - 절대 하락폭 (원래 기준)
+      - **상대 상실률** — 바닥 효과를 드러낸다
+      - **최근접 거리 배율** — 성공률이 0 이어도 팔이 얼마나 멀어졌는지는 남는다
+    """
+    relative = (drop_pp / (100.0 * base_rate)) if base_rate > 0 else float("nan")
+    strong = drop_pp >= 50.0 or (relative >= 0.8 and near_ratio >= 3.0)
+    if strong:
+        return "images_used__arm_precision_is_the_real_bottleneck"
+    if drop_pp >= 20.0 or (relative >= 0.5 and near_ratio >= 2.0):
         return "partial_use__improve_observation_and_precision_together"
-    return "images_used__arm_precision_is_the_real_bottleneck"
+    if base_rate < 0.15:
+        return "inconclusive__floor_effect__read_relative_loss_and_nearest_ratio"
+    return "images_barely_used__bottleneck_is_observation_not_precision"
 
 
 def main() -> int:
@@ -240,18 +256,31 @@ def main() -> int:
                 cond: 100.0 * (base_rate - per_condition[cond]["success_rate"])
                 for cond in CONDITIONS if cond != "full"
             }
-            v = verdict(drops["donor_both"])
+            near_full = per_condition["full"]["nearest_xy_mm_median"]
+            near_donor = per_condition["donor_both"]["nearest_xy_mm_median"]
+            near_ratio = (near_donor / near_full) if near_full > 0 else float("nan")
+            relative = (
+                drops["donor_both"] / (100.0 * base_rate) if base_rate > 0 else float("nan")
+            )
+            v = verdict(drops["donor_both"], base_rate, near_ratio)
             results[label] = {
                 "conditions": per_condition,
                 "drop_pp": drops,
+                "donor_both_relative_loss": relative,
+                "donor_both_nearest_ratio": near_ratio,
                 "verdict": v,
             }
             print("  하락폭(%p): " +
                   " · ".join(f"{k} {drops[k]:+.1f}" for k in drops))
+            print(f"  donor_both 상대 상실 {100.0 * relative:.0f}% · "
+                  f"최근접 {near_full:.1f} → {near_donor:.1f}mm ({near_ratio:.1f}배)")
             print(f"  판정 {v}")
-            if drops["donor_front"] < 5.0:
+            if drops["donor_front"] < 5.0 and base_rate >= 0.15:
                 print(f"  ⚠️ {args.front_camera} 하락 {drops['donor_front']:.1f}%p "
                       "— 기여가 없다. 계약의 카메라 2대 요구(L62)에 영향")
+            elif drops["donor_front"] < 5.0:
+                print(f"  · {args.front_camera} 하락 {drops['donor_front']:.1f}%p 이지만 "
+                      f"full 이 {100.0 * base_rate:.0f}% 라 바닥 효과다 — 기여 없음으로 읽지 않는다")
 
     payload = {
         "experiment": "obs_ablation",
