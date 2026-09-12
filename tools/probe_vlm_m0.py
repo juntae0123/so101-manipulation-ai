@@ -93,14 +93,7 @@ def _real_images(root: Path, n: int) -> list[Any]:
 
     eps = sorted(p for p in root.glob("rec_*") if (p / "frames").is_dir())
     if not eps:
-        # 번들 전체(2GB)를 서버로 옮기지 않고 뽑아낸 평평한 폴더도 받는다.
-        flat = sorted(root.glob("*.jpg"))
-        if not flat:
-            raise FileNotFoundError(
-                f"실물 프레임이 없다: {root} (rec_*/frames/*.jpg 도, *.jpg 도 없다)")
-        from PIL import Image as _I
-        return [_I.open(flat[i % len(flat)]).convert("RGB").rotate(180)
-                .resize((IMAGE_SIZE, IMAGE_SIZE)) for i in range(n)]
+        raise FileNotFoundError(f"실물 에피소드가 없다: {root}")
     out: list[Any] = []
     i = 0
     while len(out) < n:
@@ -119,10 +112,10 @@ def _real_images(root: Path, n: int) -> list[Any]:
 
 @torch.no_grad()
 def _free_generate(model: Any, processor: Any, image: Any, instruction: str,
-                   device: str, max_new_tokens: int) -> str:
+                   device: str, max_new_tokens: int, variant: str = "v1") -> str:
     msgs = [{"role": "user",
              "content": [{"type": "image"},
-                         {"type": "text", "text": build_json_question(instruction)}]}]
+                         {"type": "text", "text": build_json_question(instruction, variant)}]}]
     prompt = processor.apply_chat_template(msgs, add_generation_prompt=True)
     enc = _process(processor, prompt, image)
     moved = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in enc.items()}
@@ -133,18 +126,20 @@ def _free_generate(model: Any, processor: Any, image: Any, instruction: str,
 
 def run_condition(model: Any, processor: Any, model_id: str, condition: str,
                   items: list, images: list[Any], device: str,
-                  do_freegen: bool, max_new_tokens: int) -> ConditionReport:
+                  do_freegen: bool, max_new_tokens: int,
+                  variant: str = "v1") -> ConditionReport:
     picks: list[int] = []
     margins: list[float] = []
     frees: list[str] | None = [] if do_freegen else None
     t0 = time.time()
     for k, (it, img) in enumerate(zip(items, images)):
-        pick, margin, _ = forced_choice_scores(model, processor, img, it.instruction, device)
+        pick, margin, _ = forced_choice_scores(model, processor, img, it.instruction,
+                                              device, variant)
         picks.append(pick)
         margins.append(margin)
         if frees is not None:
             frees.append(_free_generate(model, processor, img, it.instruction,
-                                        device, max_new_tokens))
+                                        device, max_new_tokens, variant))
         if (k + 1) % 20 == 0:
             done = k + 1
             print(f"    {condition}: {done}/{len(items)}  "
@@ -152,10 +147,10 @@ def run_condition(model: Any, processor: Any, model_id: str, condition: str,
     return score_condition(model_id, condition, items, picks, margins, frees)
 
 
-def format_report(reports: list[ConditionReport]) -> str:
+def format_report(reports: list[ConditionReport], variant: str = "v1") -> str:
     lines: list[str] = []
     lines.append("=" * 78)
-    lines.append("M0 — 베이스 VLM 스킬 선택 (파인튜닝 없음)")
+    lines.append(f"M0 — 베이스 VLM 스킬 선택 (파인튜닝 없음) · enum 설명판 {variant}")
     lines.append(f"우연 = {CHANCE:.2f} · n=100 · 95% 구간 반폭 약 ±9%p")
     lines.append("=" * 78)
     lines.append("")
@@ -214,6 +209,9 @@ def main() -> int:
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--no-freegen", action="store_true",
                    help="자유생성을 건너뛴다 (강제선택만). 빠르지만 D-AI-24 수치가 안 나온다")
+    p.add_argument("--prompt-variant", choices=("v1", "v2"), default="v1",
+                   help="enum 설명 판. v2 는 서로를 배제하는 특징을 넣은 것 "
+                        "(PREREG_vlm_m0_prompt_v2_0912.md). **v1 측정을 대체하지 않는다**")
     p.add_argument("--max-new-tokens", type=int, default=48)
     p.add_argument("--out", type=Path, default=None, help="결과 JSON 경로")
     p.add_argument("--log", action="store_true")
@@ -249,7 +247,8 @@ def main() -> int:
         model = _load_model(model_id, torch.float16, args.device)
         for cname, imgs in conditions.items():
             r = run_condition(model, processor, model_id, cname, items, imgs,
-                              args.device, not args.no_freegen, args.max_new_tokens)
+                              args.device, not args.no_freegen, args.max_new_tokens,
+                              args.prompt_variant)
             lo, hi = wilson95(r.forced_correct, r.n)
             print(f"  {cname:8s} 강제선택 {r.forced_acc:.2f} [{lo:.2f},{hi:.2f}] · "
                   f"JSON {r.json_parsed}/100 · enum {r.enum_ok}/100", flush=True)
@@ -259,7 +258,7 @@ def main() -> int:
         if args.device.startswith("cuda"):
             torch.cuda.empty_cache()
 
-    text = format_report(reports)
+    text = format_report(reports, args.prompt_variant)
     print("\n" + text)
 
     payload = {
@@ -270,7 +269,8 @@ def main() -> int:
             {k: v for k, v in r.__dict__.items()} for r in reports
         ],
     }
-    out = args.out or Path("out") / f"vlm_m0_{time.strftime('%Y%m%d_%H%M%S')}.json"
+    out = args.out or Path("out") / (
+        f"vlm_m0_{args.prompt_variant}_{time.strftime('%Y%m%d_%H%M%S')}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n결과: {out}")
@@ -285,6 +285,7 @@ def main() -> int:
                 "image_conditions": sorted(conditions),
                 "camera": args.camera,
                 "freegen": not args.no_freegen,
+                "prompt_variant": args.prompt_variant,
                 "prereg": "docs/PREREG_vlm_m0_0912.md",
             },
             result={

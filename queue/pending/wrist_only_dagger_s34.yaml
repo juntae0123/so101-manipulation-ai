@@ -1,0 +1,16 @@
+# 손목 전용 시드 3·4 추가 — 게이트가 아니라 n 을 올린다
+# 사전등록: docs/PREREG_wrist_only_seeds_0912.md
+# wrist_only_dagger 와 seed_base/runs 만 다르다.
+name: wrist_only_dagger_s34
+prereg: docs/PREREG_wrist_only_seeds_0912.md
+kind: repeat_runs
+data: out/dagger_merged_20260910_092947
+cameras: cam_wrist
+runs: 2
+epochs: 30
+episodes: 100
+seed_base: 3
+eval_seed_base: 3000
+action_space: joint_delta_gripper_binary
+device: cuda
+policy_device: cpu

@@ -183,30 +183,51 @@ INSTRUCTIONS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# enum 설명 v2 — M0(2026-09-12) 이후. **원 측정을 대체하지 않는다. 별도 조건이다.**
+#
+# v1 실측 🟢: `sort_two` 0.35 이고 오분류 12/20 이 **전부 `pick_place` 방향**이었다.
+# v1 의 "집어 옮기기"는 나머지 넷의 상위 개념으로 읽힌다 — 분류도 정렬도 집어 옮기는 일이다.
+# v2 는 **서로를 배제하는 특징**을 각 항목에 넣는다. 파인튜닝 전에 이것부터 재는 이유:
+# 프롬프트로 고쳐지는 것을 가중치로 고치면 무엇이 고쳐졌는지 귀속시킬 수 없다.
+SKILL_KO_V2: dict[str, str] = {
+    "pick_place": "한 물체를 집어 **미리 정해진 한 곳**으로 옮긴다. 판별도 자세 맞춤도 없다",
+    "sort_two": "물체를 **보고 판별해 두 목적지 중 하나를 고른다**. 목적지가 물체마다 달라진다",
+    "align_fixture": "지그·치구의 정해진 자리에 **방향과 각도를 맞춰** 끼운다",
+    "present_inspect": "들어서 **보여준 뒤 제자리로 돌아온다**. 다른 곳으로 옮기지 않는다",
+    "line_up": "**여러 개를** 차례대로 간격을 맞춰 한 줄로 늘어놓는다",
+}
+
 _ENUM_LINE = " | ".join(SKILLS)
 
-SYSTEM_TASK = (
-    "로봇팔이 수행할 스킬을 하나 고른다.\n"
-    f"가능한 값은 다음 다섯 개뿐이다: {_ENUM_LINE}\n"
-    + "\n".join(f"- {s}: {SKILL_KO[s]}" for s in SKILLS)
-)
+def system_task(variant: str = "v1") -> str:
+    """The enum block shown to the model. `variant` picks the description set.
+    모델에 보이는 enum 블록. `variant` 가 설명 판을 고른다."""
+    table = SKILL_KO if variant == "v1" else SKILL_KO_V2
+    return (
+        "로봇팔이 수행할 스킬을 하나 고른다.\n"
+        f"가능한 값은 다음 다섯 개뿐이다: {_ENUM_LINE}\n"
+        + "\n".join(f"- {s}: {table[s]}" for s in SKILLS)
+    )
 
 
-def build_question(instruction: str) -> str:
+SYSTEM_TASK = system_task("v1")
+
+
+def build_question(instruction: str, variant: str = "v1") -> str:
     """The user turn shown to the model.
     모델에 보이는 사용자 발화."""
     return (
-        f"{SYSTEM_TASK}\n\n"
+        f"{system_task(variant)}\n\n"
         f'사진은 작업 현장이다. 지시: "{instruction}"\n'
         "이 지시에 해당하는 skill_id 하나만 답하라."
     )
 
 
-def build_json_question(instruction: str) -> str:
+def build_json_question(instruction: str, variant: str = "v1") -> str:
     """Free-generation variant -- measures D-AI-24 format adherence.
     자유생성용 -- D-AI-24 형식 준수율을 잰다."""
     return (
-        f"{SYSTEM_TASK}\n\n"
+        f"{system_task(variant)}\n\n"
         f'사진은 작업 현장이다. 지시: "{instruction}"\n'
         'JSON 한 줄로만 답하라: {"skill_id": "...", "confidence": 0.0, "abstain": false}'
     )
@@ -396,6 +417,7 @@ def forced_choice_scores(
     image: Any,
     instruction: str,
     device: str,
+    variant: str = "v1",
 ) -> tuple[int, float, list[float]]:
     """Score all five candidates and return (argmax, margin, per-candidate mean logprob).
 
@@ -403,7 +425,7 @@ def forced_choice_scores(
     평균을 쓰는 이유: 후보마다 토큰 수가 달라 합계를 쓰면 짧은 이름이 유리해진다.
     이 규칙은 결과를 보기 전에 정했다.
     """
-    question = build_question(instruction)
+    question = build_question(instruction, variant)
     scores: list[float] = []
 
     for cand in SKILLS:
