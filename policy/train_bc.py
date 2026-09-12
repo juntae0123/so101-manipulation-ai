@@ -42,6 +42,8 @@ from policy.bc import (
     load_train_config,
     save_checkpoint,
     gripper_index,
+    gripper_command_norms,
+    gripper_norms_from_data,
     target_scale,
     training_target,
 )
@@ -209,11 +211,13 @@ class TargetTransform:
     action_space: str
     mean: torch.Tensor | None
     std: torch.Tensor | None
+    # 이 데이터셋의 그리퍼 이진 임계값. None 이면 시뮬 설정에서 파생된 값을 쓴다.
+    grip_mid: float | None = None
 
     def __call__(self, action: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
         """Actions and states in, the tensor the loss sees out.
         행동·상태를 받아 손실이 보는 텐서를 낸다."""
-        target = training_target(action, state, self.action_space)
+        target = training_target(action, state, self.action_space, self.grip_mid)
         if self.mean is not None and self.std is not None:
             target = (target - self.mean) / self.std
         return target
@@ -383,6 +387,9 @@ def main() -> int:
     t_mean = t_std = None
     baseline_norm = float("nan")
     grip_pos_weight: float | None = None
+    grip_mid: float | None = None
+    grip_open_norm: float | None = None
+    grip_close_norm: float | None = None
     trivial_label = "항상 0"
     # Defined before the branch so the random-tensor path cannot reach the epoch
     # loop without one. An undefined transform there would be a NameError at the
@@ -400,7 +407,20 @@ def main() -> int:
             np.concatenate([e.state for e in dataset.episodes], axis=0)
         ).float()
         space = str(cfg["model"].get("action_space", "joint_absolute"))
-        raw_target = training_target(acts, sts, space)
+        # 그리퍼 규약을 **데이터에서** 뽑는다. 시뮬 설정 리터럴을 쓰면 실물 데이터의
+        # 닫힘 라벨이 0 이 된다 (2026-09-12 🟢). 시뮬 데이터에서는 설정 파생값이
+        # 그대로 나오므로 기존 수치가 바뀌지 않는다 — tools/check_gripper_norms.py 가 검정한다.
+        if space == "joint_delta_gripper_binary":
+            g = gripper_index()
+            grip_open_norm, grip_close_norm, grip_mid = gripper_norms_from_data(acts[:, g])
+            print(f"그리퍼 규약 (데이터에서 파생): 열림 {grip_open_norm:+.4f} · "
+                  f"닫힘 {grip_close_norm:+.4f} · 임계값 {grip_mid:+.4f}")
+            ref_o, ref_c = gripper_command_norms()
+            ref_mid = (ref_o + ref_c) / 2.0
+            if abs(grip_mid - ref_mid) > 0.02:
+                print(f"  ⚠️ 설정 파생 임계값({ref_mid:+.4f})과 {abs(grip_mid - ref_mid):.4f} 다르다 — "
+                      f"**시뮬과 다른 그리퍼 규약의 데이터다.** 이 체크포인트를 시뮬 수치와 나란히 놓지 마라")
+        raw_target = training_target(acts, sts, space, grip_mid)
         if bool(t.get("normalize_target", True)):
             t_mean, t_std = target_scale(raw_target, space)
         # Built here and used by BOTH passes. The baseline below is computed
@@ -408,7 +428,7 @@ def main() -> int:
         # read against cannot end up in different units.
         # 여기서 만들어 **양쪽 패스**가 쓴다. 아래 baseline 도 같은 객체를 통과하므로,
         # epoch 손실과 그것을 읽는 기준이 다른 단위가 될 수 없다.
-        target_fn = TargetTransform(space, t_mean, t_std)
+        target_fn = TargetTransform(space, t_mean, t_std, grip_mid)
         scaled = target_fn(acts, sts)
         # What the head is asked to fit, joint by joint, before any scaling. A
         # target that is exactly zero on most steps (the gripper delta was zero
@@ -517,6 +537,7 @@ def main() -> int:
             save_checkpoint(best_out, model, CheckpointMeta(
                 camera_names=list(cameras), contract_version=CONTRACT_VERSION,
                 action_space=model.action_space,
+                gripper_open_norm=grip_open_norm, gripper_close_norm=grip_close_norm,
                 target_mean=[float(v) for v in t_mean.cpu()] if t_mean is not None else None,
                 target_std=[float(v) for v in t_std.cpu()] if t_std is not None else None,
                 train_config=cfg, config_sha=file_digest(DEFAULT_CONFIG),
@@ -542,6 +563,7 @@ def main() -> int:
     save_checkpoint(out, model, CheckpointMeta(
             camera_names=list(cameras), contract_version=CONTRACT_VERSION,
             action_space=model.action_space,
+            gripper_open_norm=grip_open_norm, gripper_close_norm=grip_close_norm,
             target_mean=[float(v) for v in t_mean.cpu()] if t_mean is not None else None,
             target_std=[float(v) for v in t_std.cpu()] if t_std is not None else None,
             train_config=cfg, config_sha=file_digest(DEFAULT_CONFIG),
@@ -577,6 +599,9 @@ def main() -> int:
                 "trivial_baseline_loss": baseline_norm, "n_params": n_params,
                 "trivial_baseline_kind": trivial_label,
                 "gripper_pos_weight": grip_pos_weight,
+                "gripper_open_norm": grip_open_norm,
+                "gripper_close_norm": grip_close_norm,
+                "gripper_threshold": grip_mid,
                 "gripper_loss_weight": (
                     GRIPPER_LOSS_WEIGHT
                     if model.action_space == "joint_delta_gripper_binary"

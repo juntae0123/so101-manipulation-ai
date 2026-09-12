@@ -48,6 +48,15 @@ MASK_R_MIN, MASK_B_MIN, MASK_RG_MIN, MASK_BG_MIN = 110, 70, 60, 25
 MIN_BLOB_PIXELS = 200
 SCALE_CORRECTION = 0.97859       # 이 마스크가 마커를 +2.19% 크게 잡는 것을 상쇄한다
 
+# --- 유효성 검사 -------------------------------------------------------------
+# 첫 판(2026-09-12)에는 이게 없었고, 71편 전체에서 gap 이 -0.6 ~ 376.3mm 로 나왔다.
+# 물리적 상한이 90mm 인데 376mm 를 **조용히** 내놓았다 -- 2-means 가 마커가 아닌
+# 마젠타 영역(혹은 마커 하나가 둘로 쪼개진 것)을 잡은 것이다.
+# 계측기가 스스로 고장을 알리지 않는 전형이라, 검사를 코드에 넣는다.
+MAX_SIZE_RATIO = 1.6             # 같은 마커 둘이다. 투영 면적이 이보다 벌어지면 오검출
+GAP_VALID_MM = (0.0, 90.0)       # umi/raw.py UMI_GAP_RANGE_M = (0.0, 0.090)
+MAX_FILL_SLACK = 2.2             # blob 넓이 대비 경계상자 넓이. 원이면 약 4/pi=1.27
+
 # --- fixture 게이트 (결과 보기 전에 고정) ---------------------------------------
 FIXTURE_MEDIAN_MM = 0.5
 FIXTURE_MAX_MM = 3.0
@@ -70,7 +79,7 @@ class FrameResult:
     status: str
 
 
-def detect(path: Path) -> FrameResult:
+def detect(path: Path, draft: int = 1) -> FrameResult:
     """Find the two markers and convert their centre distance to a finger gap.
     마커 둘을 찾아 중심거리를 손가락 간격으로 바꾼다.
 
@@ -80,12 +89,20 @@ def detect(path: Path) -> FrameResult:
     마젠타 영역이다. 연결요소 라이브러리를 끌어오지 않는 이유이기도 하다 (scipy 불필요).
     """
     idx = int(path.stem)
-    im = np.asarray(Image.open(path).convert("RGB"), dtype=np.int16)
+    img = Image.open(path)
+    if draft > 1:
+        # JPEG 을 1/draft 로 **디코드 단계에서** 줄인다. 1920x1080 전체를 푸는 것보다
+        # 훨씬 싸다. 거리와 지름이 같은 비율로 줄어드므로 mm/px 환산은 불변이고,
+        # SCALE_CORRECTION 도 그대로다 -- 단 마스크가 미세하게 달라지므로
+        # **이 설정으로 fixture 를 다시 통과해야 쓴다.**
+        img.draft("RGB", (img.size[0] // draft, img.size[1] // draft))
+    im = np.asarray(img.convert("RGB"), dtype=np.int16)
+    min_blob = max(20, MIN_BLOB_PIXELS // (draft * draft))
     r, g, b = im[..., 0], im[..., 1], im[..., 2]
     mask = ((r > MASK_R_MIN) & (b > MASK_B_MIN)
             & (r - g > MASK_RG_MIN) & (b - g > MASK_BG_MIN))
     ys, xs = np.nonzero(mask)
-    if xs.size < 2 * MIN_BLOB_PIXELS:
+    if xs.size < 2 * min_blob:
         return FrameResult(idx, None, None, None, STATUS_FAILED)
 
     centres = np.array([xs.min(), xs.max()], dtype=float)
@@ -99,8 +116,35 @@ def detect(path: Path) -> FrameResult:
         centres = moved
 
     left, right = assign == 0, assign == 1
-    if left.sum() < MIN_BLOB_PIXELS or right.sum() < MIN_BLOB_PIXELS:
+    if left.sum() < min_blob or right.sum() < min_blob:
         return FrameResult(idx, None, None, None, STATUS_FAILED)
+
+    # 2-means 는 마스크의 **모든** 픽셀을 둘 중 하나에 배정한다 -- 멀리 떨어진 잡음
+    # 픽셀도 포함된다. 그대로 두면 경계상자 검사가 무의미해지고 중심도 끌려간다.
+    # 각 덩이에서 중심으로부터 중앙거리의 2.5배 밖을 떨어낸다.
+    def _trim(sel: np.ndarray) -> np.ndarray:
+        cx, cy = xs[sel].mean(), ys[sel].mean()
+        d = np.hypot(xs[sel] - cx, ys[sel] - cy)
+        keep = d <= 2.5 * max(float(np.median(d)), 1.0)
+        out = sel.copy()
+        out[np.nonzero(sel)[0][~keep]] = False
+        return out
+
+    left, right = _trim(left), _trim(right)
+    if left.sum() < min_blob or right.sum() < min_blob:
+        return FrameResult(idx, None, None, None, STATUS_FAILED)
+
+    n0, n1 = int(left.sum()), int(right.sum())
+    if max(n0, n1) / min(n0, n1) > MAX_SIZE_RATIO:
+        return FrameResult(idx, None, None, None, STATUS_FAILED)
+
+    # 두 덩이가 각각 원에 가까운가. 마커 하나가 둘로 쪼개졌거나 마커 아닌 것이
+    # 섞이면 경계상자가 넓이에 비해 커진다.
+    for sel in (left, right):
+        bw = xs[sel].max() - xs[sel].min() + 1
+        bh = ys[sel].max() - ys[sel].min() + 1
+        if bw * bh > MAX_FILL_SLACK * int(sel.sum()) * 4.0 / np.pi:
+            return FrameResult(idx, None, None, None, STATUS_FAILED)
 
     cx0, cy0 = xs[left].mean(), ys[left].mean()
     cx1, cy1 = xs[right].mean(), ys[right].mean()
@@ -115,14 +159,17 @@ def detect(path: Path) -> FrameResult:
 
     span_mm = DIST_AT_GAP_MAX_MM - DIST_AT_GAP_MIN_MM
     gap_mm = (dist_mm - DIST_AT_GAP_MIN_MM) / span_mm * GAP_AT_DIST_MAX_MM
+    if not (GAP_VALID_MM[0] <= gap_mm <= GAP_VALID_MM[1]):
+        # 물리적으로 불가능한 값은 채우지 않는다. 채우면 학습이 그것을 배운다.
+        return FrameResult(idx, None, dist_px, dia_px, STATUS_FAILED)
     return FrameResult(idx, gap_mm, dist_px, dia_px, STATUS_DETECTED)
 
 
-def run_episode(ep: Path) -> list[FrameResult]:
+def run_episode(ep: Path, draft: int = 1) -> list[FrameResult]:
     frames = sorted((ep / "frames").glob("*.jpg"))
     if not frames:
         raise FileNotFoundError(f"프레임이 없다: {ep}")
-    return [detect(f) for f in frames]
+    return [detect(f, draft) for f in frames]
 
 
 def write_csv(ep: Path, results: list[FrameResult], out_name: str) -> Path:
@@ -185,6 +232,10 @@ def main() -> int:
     ap.add_argument("--out-name", type=str, default="gripper_reimpl.csv",
                     help="원본 gripper.csv 와 섞이지 않게 기본 이름을 다르게 둔다")
     ap.add_argument("--only", type=str, default=None, help="이 rec_* 하나만 처리")
+    ap.add_argument("--draft", type=int, default=1,
+                    help="JPEG 을 1/N 로 디코드해 가속한다. 바꾸면 fixture 를 다시 통과해야 한다")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="이미 out-name 이 있는 에피소드는 건너뛴다 (중단 후 재개)")
     ap.add_argument("--dry-run", action="store_true", help="fixture 검정만 하고 쓰지 않는다")
     args = ap.parse_args()
 
@@ -205,7 +256,7 @@ def main() -> int:
         if not target:
             target = [root / args.fixture_episode]
         print(f"\n== 계측기 검정 — {args.fixture_episode} ==")
-        res = run_episode(target[0])
+        res = run_episode(target[0], args.draft)
         ok, msg = check_fixture(res, read_reference(args.fixture))
         print(("✓ 통과  " if ok else "✗ 실패  ") + msg)
         if not ok:
@@ -219,7 +270,9 @@ def main() -> int:
     n_frames = n_failed = 0
     per_ep: list[tuple[str, int, int, float, float, int]] = []
     for i, ep in enumerate(eps, 1):
-        res = run_episode(ep)
+        if args.skip_existing and (ep / args.out_name).exists():
+            continue
+        res = run_episode(ep, args.draft)
         gaps = [r.gap_mm for r in res if r.gap_mm is not None]
         failed = sum(1 for r in res if r.status == STATUS_FAILED)
         n_frames += len(res)
