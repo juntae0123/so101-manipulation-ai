@@ -36,6 +36,17 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# Windows Git Bash 에서 출력을 파이프로 넘기면 stdout 이 tty 가 아니라서 파이썬이
+# 로캘 인코딩(cp949)을 잡는다. 그러면 한글 문서에 흔한 em-dash 하나에 UnicodeEncodeError
+# 로 죽는다 -- 실행 자체는 멀쩡한데 출력 단계에서 날아간다 (2026-09-12 실제로 겪었다).
+# PYTHONIOENCODING 을 안 건 사람도 그대로 돌 수 있게 여기서 막는다.
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - 재설정이 안 되는 스트림이면 그냥 둔다
+        pass
+
+
 # --- 교정 상수 🔵 (황도경 구두, 2026-09-12) ------------------------------------
 MARKER_DIAMETER_MM = 15.0
 DIST_AT_GAP_MIN_MM = 37.6        # 마커 중심거리 37.6mm -> gap 0mm
@@ -77,6 +88,10 @@ class FrameResult:
     dist_px: float | None
     diameter_px: float | None
     status: str
+    # 마커 두 개의 픽셀 중심. hand-eye 를 영상에서 푸는 데 쓴다
+    # (tools/measure_handeye.py). gap 계산에는 영향이 없다 -- 읽기만 한다.
+    mid_u: float | None = None
+    mid_v: float | None = None
 
 
 def detect(path: Path, draft: int = 1) -> FrameResult:
@@ -158,11 +173,12 @@ def detect(path: Path, draft: int = 1) -> FrameResult:
     dist_mm = dist_px * mm_per_px
 
     span_mm = DIST_AT_GAP_MAX_MM - DIST_AT_GAP_MIN_MM
+    mid_u, mid_v = (cx0 + cx1) / 2.0, (cy0 + cy1) / 2.0
     gap_mm = (dist_mm - DIST_AT_GAP_MIN_MM) / span_mm * GAP_AT_DIST_MAX_MM
     if not (GAP_VALID_MM[0] <= gap_mm <= GAP_VALID_MM[1]):
         # 물리적으로 불가능한 값은 채우지 않는다. 채우면 학습이 그것을 배운다.
-        return FrameResult(idx, None, dist_px, dia_px, STATUS_FAILED)
-    return FrameResult(idx, gap_mm, dist_px, dia_px, STATUS_DETECTED)
+        return FrameResult(idx, None, dist_px, dia_px, STATUS_FAILED, mid_u, mid_v)
+    return FrameResult(idx, gap_mm, dist_px, dia_px, STATUS_DETECTED, mid_u, mid_v)
 
 
 def run_episode(ep: Path, draft: int = 1) -> list[FrameResult]:

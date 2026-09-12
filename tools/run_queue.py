@@ -40,6 +40,8 @@ from pathlib import Path
 # 2026-09-10 에 그렇게 큐가 안 돌았다 — 도구가 호출자 환경에 의존하면 안 된다.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from tracking.exp_log import CODE_PATHS  # noqa: E402  목록 정본
+
 import yaml  # noqa: E402
 
 AI_ROOT = Path(__file__).resolve().parents[1]
@@ -48,7 +50,8 @@ PENDING, DONE, FAILED = QUEUE / "pending", QUEUE / "done", QUEUE / "failed"
 LEDGER = QUEUE / "LEDGER.md"
 
 # 이 경로가 더러우면 결과의 code_sha 가 실제 실행 코드를 가리키지 않는다.
-DIRTY_GUARD = ("eval", "policy", "sim", "contract", "configs", "tools")
+# 목록의 정본은 `tracking/exp_log.CODE_PATHS` 다 — 같은 목록을 두 군데 두면 갈라진다.
+DIRTY_GUARD = CODE_PATHS
 
 REQUIRED = ("name", "prereg", "kind", "data")
 KINDS = ("repeat_runs",)

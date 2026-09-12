@@ -49,6 +49,33 @@ def _git_rev() -> str:
     return out if code == 0 and out else "unknown"
 
 
+# 결과의 `code_sha` 가 실제 실행 코드를 가리키는가를 좌우하는 경로.
+# **정본은 여기 하나다** -- `tools/run_queue.py` 가 이것을 import 해서 쓴다.
+# 같은 목록을 두 군데 두면 갈라지고, 갈라진 줄 모른 채로 한쪽만 고치게 된다.
+CODE_PATHS: tuple[str, ...] = ("eval", "policy", "sim", "contract", "configs",
+                               "tools", "umi", "vlm", "data", "track_a", "tracking")
+
+
+def _git_dirty_code() -> bool | None:
+    """True when tracked code changed. None when not a repo.
+    추적 중인 **코드**가 바뀌었으면 True. 저장소가 아니면 None.
+
+    왜 `dirty` 와 따로 두는가 (2026-09-12).
+
+    `dirty` 는 `git status --porcelain` 이라 저장소 전체를 본다. 그런데 실행 자체가
+    `EXP_LOG.jsonl` · `FINDINGS.md` · `queue/LEDGER.md` 를 쓰므로 **두 번째 실행부터는
+    항상 dirty=True** 다. 그래서 이 깃발로는 "코드가 커밋 상태였나"를 알 수 없고,
+    실제로 2026-09-12 에 손목 전용 실행 기록의 `dirty=True` 를 provenance 구멍으로
+    잘못 읽었다 -- 더러운 것은 러너 자신의 출력 파일이었고 코드는 깨끗했다.
+
+    `dirty_code` 는 그 애매함이 없다. **이쪽이 True 면 실제로 되짚어갈 수 없다.**
+    """
+    code, out = _git("diff", "--name-only", "HEAD", "--", *CODE_PATHS)
+    if code != 0:
+        return None
+    return bool(out.strip())
+
+
 def _git_dirty() -> bool | None:
     """True when the worktree has uncommitted changes, None when not a repo.
     커밋 안 된 변경이 있으면 True. **저장소가 아니면 None.**
@@ -112,6 +139,7 @@ def log_run(
 
     rev = _git_rev()
     dirty = _git_dirty()
+    dirty_code = _git_dirty_code()
     if rev == "unknown":
         print(
             f"⚠️ EXP_LOG: {REPO_AI_ROOT} 는 git 체크아웃이 아니다. "
@@ -126,6 +154,9 @@ def log_run(
         "issue": issue,
         "git_rev": rev,
         "git_dirty": dirty,
+        # 러너 자신이 EXP_LOG·FINDINGS·LEDGER 를 쓰므로 git_dirty 는 두 번째 실행부터
+        # 항상 True 다. **판정에 쓸 것은 이쪽이다.**
+        "git_dirty_code": dirty_code,
         "code_sha": code_digest(),
         "env": {
             "python": platform.python_version(),
