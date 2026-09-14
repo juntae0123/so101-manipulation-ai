@@ -117,7 +117,7 @@ def main() -> int:
                 id_e.append(float(np.abs(s[t][ARM] - a[t][ARM]).mean()))
                 ex_e.append(float(np.abs((2 * s[t] - s[t - 1])[ARM] - a[t][ARM]).mean()))
 
-        b, i, x = (float(np.median(v)) for v in (bc_e, id_e, ex_e))
+        b, i, x = (float(np.mean(v)) for v in (bc_e, id_e, ex_e))
         clip = pol.n_clipped / max(pol.n_actions, 1)
         results[name] = {"bc": b, "identity": i, "extrap": x,
                          "n": len(bc_e), "n_val_ep": len(sel), "clip_rate": clip}
