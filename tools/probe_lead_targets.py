@@ -28,16 +28,27 @@ ARM = slice(0, 5)
 CTRL_DROP_REF = 0.204  # ctrl 이 만든 낙폭 (0914 측정 🟢). 비교 기준점
 
 
-def explained(state: list[np.ndarray], target: list[np.ndarray]) -> tuple[float, float, float]:
+def explained(
+    state: list[np.ndarray], target: list[np.ndarray], horizon: float = 1.0
+) -> tuple[float, float, float]:
     """Extrapolation explainability of a target given state history.
-    state 이력만으로 타깃이 얼마나 설명되는지. probe_command_vs_action 과 동일 정의."""
+    state 이력만으로 타깃이 얼마나 설명되는지.
+
+    ⚠️ 정정 2026-09-14 — `horizon` 이 없던 판(1스텝 고정)은 **k 스텝 앞 타깃을
+    1스텝 외삽으로 맞히라고 시키는** 계측기였다. k 가 커질수록 기준선이 자동으로
+    무너져 낙폭이 커지고, 그것이 "좋은 타깃"으로 오독된다. 고장난 계측기는 스스로
+    알리지 않는다.
+
+    horizon=k 면 예측은 `s[t] + k*(s[t] - s[t-1])` — "가던 대로 k 스텝 가면 어디".
+    horizon=1 은 `2*s[t] - s[t-1]` 로 옛 정의와 같아, `probe_command_vs_action.py`
+    의 수치와 그대로 대조된다."""
     ids, exs = [], []
     for s, a in zip(state, target):
         if s.shape[0] < 4:
             continue
         cur = s[1:-1]
         tgt = a[1:-1]
-        pred = 2.0 * s[1:-1] - s[:-2]
+        pred = s[1:-1] + horizon * (s[1:-1] - s[:-2])
         ids.append(np.abs(tgt - cur).mean(axis=0))
         exs.append(np.abs(tgt - pred).mean(axis=0))
     if not ids:
@@ -99,7 +110,9 @@ def main() -> int:
     print("  -> 통과")
 
     print(f"\n에피소드 {len(states)}편 · 단위 계약 [-1,1] · 팔 5축")
-    print(f"\n  {'타깃':<24}{'크기':>11}{'외삽잔차':>12}{'설명력':>10}{'리드/이동':>11}")
+    print("\n  설명력(1스텝) — 기준선이 1스텝 외삽 고정. k 가 크면 기준선이 무너진다")
+    print("  설명력(k스텝) — 기준선이 s[t] + k*(s[t]-s[t-1]). **공정 비교는 이쪽이다**")
+    print(f"\n  {'타깃':<20}{'크기':>10}{'설명력(1스텝)':>15}{'설명력(k스텝)':>15}{'리드/이동':>11}")
 
     base_expl = None
     rows = {}
@@ -108,23 +121,31 @@ def main() -> int:
     ))
     for k in args.k:
         tgt = [lead_target(s, k) for s in states]
-        e, i, x = explained(states, tgt)
+        e1, i, x1 = explained(states, tgt, horizon=1.0)
+        ek, _, xk = explained(states, tgt, horizon=float(k))
         lead = float(np.median([np.abs(t[1:-1] - s[1:-1]).mean() for s, t in zip(states, tgt)]))
         if k == 1:
-            base_expl = e
-        rows[f"lead{k}"] = {"explained": e, "mag": i, "extrap": x,
+            base_expl = ek
+        rows[f"lead{k}"] = {"explained_1step": e1, "explained_kstep": ek,
+                            "mag": i, "extrap_1step": x1, "extrap_kstep": xk,
+                            "horizon": float(k),
                             "lead_ratio": lead / max(move_ref, 1e-12)}
-        print(f"  {'state[t+' + str(k) + ']':<24}{i:>11.5f}{x:>12.5f}{e:>9.1%}"
+        print(f"  {'state[t+' + str(k) + ']':<20}{i:>10.5f}{e1:>14.1%}{ek:>14.1%}"
               f"{lead / max(move_ref, 1e-12):>10.2f}x")
 
     if args.command and any(c is not None for c in commands):
         pair = [(s, c) for s, c in zip(states, commands) if c is not None]
-        e, i, x = explained([s for s, _ in pair], [c for _, c in pair])
+        ss = [s for s, _ in pair]
+        cc = [c for _, c in pair]
         lead = float(np.median([np.abs(c[1:-1] - s[1:-1]).mean() for s, c in pair]))
-        rows["command"] = {"explained": e, "mag": i, "extrap": x,
-                           "lead_ratio": lead / max(move_ref, 1e-12)}
-        print(f"  {'command = ctrl':<24}{i:>11.5f}{x:>12.5f}{e:>9.1%}"
-              f"{lead / max(move_ref, 1e-12):>10.2f}x")
+        ratio = lead / max(move_ref, 1e-12)
+        # ctrl 은 정수 스텝이 아니다. 실측 리드 비율을 그대로 지평으로 쓴다
+        e1, i, x1 = explained(ss, cc, horizon=1.0)
+        ek, _, xk = explained(ss, cc, horizon=ratio)
+        rows["command"] = {"explained_1step": e1, "explained_kstep": ek,
+                           "mag": i, "extrap_1step": x1, "extrap_kstep": xk,
+                           "horizon": ratio, "lead_ratio": ratio}
+        print(f"  {'command = ctrl':<20}{i:>10.5f}{e1:>14.1%}{ek:>14.1%}{ratio:>10.2f}x")
         if miss:
             print(f"  (ctrl 사이드카 누락 {miss}편)")
 
@@ -132,17 +153,22 @@ def main() -> int:
         print("\n  !! k=1 이 목록에 없어 낙폭을 낼 수 없다")
         return 1
 
-    print(f"\n[ 낙폭 — k=1 기준 {base_expl:.1%}. ctrl 이 만든 낙폭은 {CTRL_DROP_REF:.1%}p 였다 ]")
+    cmd_row = rows.get("command")
+    cmd_drop = base_expl - cmd_row["explained_kstep"] if cmd_row else CTRL_DROP_REF
+    print(f"\n[ 낙폭 — k스텝 기준선. k=1 기준 {base_expl:.1%}, "
+          f"ctrl 낙폭 {cmd_drop * 100:.1f}%p ]")
     for name, r in rows.items():
         if name == "lead1":
             continue
-        d = base_expl - r["explained"]
-        mark = "ctrl 이상" if d >= CTRL_DROP_REF else "ctrl 미만"
+        d = base_expl - r["explained_kstep"]
+        mark = "ctrl 이상" if d >= cmd_drop else "ctrl 미만"
         print(f"  {name:<12}{d * 100:>7.1f}%p   {mark}")
 
     print("\n  이 도구가 답하지 않는 것")
     print("     - 설명력이 낮다고 학습이 되는 것은 아니다. 롤아웃으로만 안다")
     print("     - 리드가 너무 크면 타깃이 관측과 무관해진다. 그것도 설명력은 낮게 나온다")
+    print("     - 정책은 state 이력이 아니라 현재 state 한 장만 본다. 외삽 기준선은")
+    print("       정책이 실제로 쓸 수 있는 것보다 강하다 — 설명력은 상한이다")
     print("     - 전부 시뮬이다. 실데이터에서 같은 k 가 최적이라는 보장은 없다\n")
 
     if args.out:
