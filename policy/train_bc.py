@@ -302,6 +302,10 @@ def main() -> int:
              "⚠️ train_config_sha 는 파일 해시라 이 덮어쓰기를 반영하지 않는다",
     )
     parser.add_argument(
+        "--target-sidecar", type=str, default=None,
+        help="계약 action 대신 이 사이드카(.<이름>.npy)를 학습 타깃으로 쓴다. 예: command",
+    )
+    parser.add_argument(
         "--cameras", type=str, default=None,
         help="쉼표로 구분한 카메라 이름. 데이터셋 카메라의 **부분집합**만 쓴다. "
              "예: --cameras cam_wrist (실물 배포 구성. L76)",
@@ -336,7 +340,8 @@ def main() -> int:
             [c.strip() for c in args.cameras.split(",") if c.strip()]
             if args.cameras else None
         )
-        dataset = EpisodeDataset(args.data, cfg, camera_names=cam_override)
+        dataset = EpisodeDataset(args.data, cfg, camera_names=cam_override,
+                                 target_sidecar=args.target_sidecar)
         cameras = dataset.camera_names
         if cam_override is not None:
             print(f"· 카메라 덮어쓰기: {cameras} (데이터셋은 건드리지 않았다)")

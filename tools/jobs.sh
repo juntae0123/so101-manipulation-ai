@@ -11,7 +11,7 @@ running_names=""
 
 printf '\n\033[1m[ 실행 중 ]\033[0m\n'
 any=0
-for pid in $(pgrep -f 'train_bc\.py|probe_[a-z_]*\.py|eval_rollout\.py' 2>/dev/null); do
+for pid in $(pgrep -f 'train_bc\.py|collect_sim\.py|probe_[a-z_]*\.py|eval_rollout\.py' 2>/dev/null); do
   comm=$(ps -o comm= -p "$pid" 2>/dev/null)
   case "${comm:-}" in *python*) ;; *) continue;; esac
 
@@ -19,6 +19,9 @@ for pid in $(pgrep -f 'train_bc\.py|probe_[a-z_]*\.py|eval_rollout\.py' 2>/dev/n
   [ -z "$cmd" ] && continue
 
   outarg=$(printf '%s' "$cmd" | grep -o -- '--out [^ ]*' | head -1 | cut -d' ' -f2)
+  if [ -z "${outarg:-}" ]; then
+    outarg=$(printf '%s' "$cmd" | grep -o -- '--tag [^ ]*' | head -1 | cut -d' ' -f2)
+  fi
   name=$(basename "${outarg:-job-$pid}"); name="${name%.*}"
   running_names="$running_names $name"
 
@@ -63,7 +66,7 @@ done
 printf '\n\033[1m[ GPU ]\033[0m\n'
 if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader 2>/dev/null \
-    | awk -F', ' '$2 != "0 MiB" {printf "  %-3s %-10s %s  ●\n", $1, $2, $3; next} {printf "  %-3s %-10s %s\n", $1, $2, $3}'
+    | awk -F', ' '($2+0) > 50 {printf "  %-3s %-10s %s  ●\n", $1, $2, $3; next} {printf "  %-3s %-10s %s\n", $1, $2, $3}'
 else
   printf '  (nvidia-smi 없음)\n'
 fi

@@ -50,7 +50,14 @@ class EpisodeDataset(Dataset):
         cfg: dict[str, Any],
         camera_names: list[str] | None = None,
         strict: bool = True,
+        target_sidecar: str | None = None,
     ) -> None:
+        # 계약의 `action` 대신 사이드카 배열을 학습 타깃으로 쓴다 (검증용).
+        # 계약 0.3.0 은 action[t]=state[t+1] 이라 "이미 간 거리"가 타깃이 된다.
+        # 그 규약이 학습을 무력화하는지 가르기 위해, 수집기가 남긴 command(=ctrl)를
+        # 타깃으로 바꿔 학습할 수 있어야 한다. 계약 파일은 건드리지 않는다.
+        self.target_sidecar = target_sidecar
+        self.targets: list[Any] = []
         self.root = Path(root)
         files = sorted(self.root.glob("*.npz"))
         if not files:
@@ -110,6 +117,18 @@ class EpisodeDataset(Dataset):
                         f"(있는 것: {list(ep.meta.cameras)})"
                     )
             i = len(self.episodes)
+            if self.target_sidecar:
+                side = ep_path.with_suffix(f".{self.target_sidecar}.npy")
+                if not side.exists():
+                    raise FileNotFoundError(f"사이드카가 없다: {side}")
+                tgt = np.load(side).astype(np.float32)
+                if tgt.shape != ep.action.shape:
+                    raise ValueError(
+                        f"{side.name} shape {tgt.shape} != action {ep.action.shape}"
+                    )
+                self.targets.append(tgt)
+            else:
+                self.targets.append(None)
             self.episodes.append(ep)
             self.index.extend((i, t) for t in range(ep.meta.n_steps))
 
@@ -137,7 +156,10 @@ class EpisodeDataset(Dataset):
                 arr = arr.clamp_(0.0, 1.0)
             images[cam] = (arr - self.mean) / self.std
         state = torch.from_numpy(ep.state[t].astype(np.float32))
-        action = torch.from_numpy(ep.action[t].astype(np.float32))
+        src = self.targets[ep_i]
+        action = torch.from_numpy(
+            (ep.action[t] if src is None else src[t]).astype(np.float32)
+        )
         return images, state, action
 
     def set_image_noise(self, gray_levels: float, train_indices: list[int] | None) -> None:
@@ -157,6 +179,7 @@ class EpisodeDataset(Dataset):
         return (
             f"{self.root.name}: 에피소드 {len(self.episodes)}개, "
             f"샘플 {len(self.index)}개, 카메라 {self.camera_names}"
+            + (f", 타깃=사이드카 {self.target_sidecar}" if self.target_sidecar else "")
             + (f", 계약위반으로 제외 {len(self.rejected)}개" if self.rejected else "")
         )
 

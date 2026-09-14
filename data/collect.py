@@ -49,9 +49,16 @@ class EpisodeRecorder:
         self.model = model
         self.cfg = cfg
         self.renderer = renderer
-        self.cameras = [
+        from contract.episode import CAMERA_NAMES
+
+        _all = [
             mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_CAMERA, i) for i in range(model.ncam)
         ]
+        # 계약 0.3.0 은 cam_wrist 한 대다 (D-AI-46). 씬은 2대 그대로 두고 기록만 거른다 —
+        # configs/so101.yaml 은 양 트랙 공유 파일이라 건드리지 않는다.
+        self.cameras = [c for c in _all if c in CAMERA_NAMES]
+        if not self.cameras:
+            raise RuntimeError(f"계약 카메라가 씬에 없다: {CAMERA_NAMES} vs {_all}")
         self.images: dict[str, list[np.ndarray]] = {c: [] for c in self.cameras}
         self.state: list[np.ndarray] = []
         self.action: list[np.ndarray] = []
@@ -79,12 +86,18 @@ class EpisodeRecorder:
         기록한 버퍼를 계약 Episode 로 조립한다."""
         meta.n_steps = len(self.state)
         meta.cameras = list(self.cameras)
+        # 계약 0.3.0: action[t] = state[t+1]. 마지막 스텝은 자기 자신으로 채운다.
+        # ⚠️ 이 규약 아래서는 기록해 둔 data.ctrl 이 버려진다 — 계약에 그 필드가 없다.
+        state_arr = np.stack(self.state).astype(np.float32)
+        action_arr = np.vstack([state_arr[1:], state_arr[-1:]]).astype(np.float32)
+        # 내린 명령(ctrl)은 계약에 필드가 없어 버려진다. 가설 검증을 위해 노출한다.
+        self.command = np.stack(self.action).astype(np.float32)
         return Episode(
             meta=meta,
             images={c: np.stack(v).astype(np.uint8) for c, v in self.images.items()},
-            state=np.stack(self.state).astype(np.float32),
+            state=state_arr,
             state_timestamp=np.asarray(self.state_ts, dtype=np.float64),
-            action=np.stack(self.action).astype(np.float32),
+            action=action_arr,
             action_timestamp=np.asarray(self.action_ts, dtype=np.float64),
         )
 
@@ -210,7 +223,7 @@ def collect_one(
             "caveat": "스크립트 시연이다. 사람 시연이 아니다. 궤적 다양성이 없다.",
         },
     )
-    return rec.build(meta)
+    return rec.build(meta), rec.command
 
 
 def main() -> None:
@@ -242,7 +255,7 @@ def main() -> None:
     with mujoco.Renderer(model, height=height, width=width) as renderer:
         for i in range(args.episodes):
             xy = base_xy + rng.uniform(-args.jitter, args.jitter, size=2)
-            ep = collect_one(
+            got = collect_one(
                 cfg,
                 model,
                 renderer,
@@ -251,15 +264,18 @@ def main() -> None:
                 args.author,
                 args.skill_id,
             )
-            if ep is None:
+            if got is None:
                 skipped += 1
                 print(f"[{i + 1:3d}/{args.episodes}] SKIP  도달 불가 xy=({xy[0]:+.3f},{xy[1]:+.3f})")
                 continue
+            ep, command = got
             problems = validate(ep)
             if problems:
                 print(f"[{i + 1:3d}/{args.episodes}] INVALID: {problems}")
                 continue
             path = write_episode(ep, args.out)
+            # 사이드카: 내린 명령. 계약 npz 를 안 건드리므로 검증기와 무관하다.
+            np.save(path.with_suffix(".command.npy"), command)
             written.append(path)
             n_success += int(ep.meta.success)
             print(
