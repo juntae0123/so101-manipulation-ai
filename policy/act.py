@@ -233,7 +233,19 @@ class ACTPolicy:
 
     @property
     def name(self) -> str:
-        return "act" if self.chunk > 1 else "bc"
+        """Always "bc" — this is the harness slot, not the model family.
+        항상 "bc" 다. 이것은 모델 종류가 아니라 **평가 harness 안의 "학습 정책" 자리**다.
+
+        ⚠️ 2026-09-15 정정 — 여기서 chunk>1 일 때 "act" 를 돌려줬다가 8잡이 전부
+        죽었다. `eval/repeat.py` 가 `success_rates["bc"]` 로 읽고,
+        `eval/rollout.py` 는 **배포 게이트(floor/chance)·실패모양 리포트·클립 통계**를
+        전부 이 키로 찾는다. 이름이 달라지면 repeat 은 KeyError 로 죽고 rollout 은
+        **게이트를 조용히 건너뛴다** — 후자가 훨씬 나쁘다. 수치는 그대로 나오는데
+        판정만 사라진다.
+
+        청크 길이는 이름이 아니라 `describe()`·체크포인트 메타·EXP_LOG 조건의
+        `chunk` 키에 남는다. 기록은 하나도 잃지 않는다."""
+        return "bc"
 
     def reset(self, seed: int | None = None) -> None:
         """Clear the chunk buffer. A stale buffer would leak the previous episode.
