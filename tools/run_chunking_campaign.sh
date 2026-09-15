@@ -45,6 +45,21 @@ write_item () {          # $1=name  $2=chunk  $3=sidecar(또는 -)  $4=noise(또
   echo "  $f"
 }
 
+# ── 0. 관통 스모크 ─────────────────────────────────────────────────────────
+# 학습 -> 체크포인트 -> 롤아웃 -> 성공률 파싱까지 **실제 호출 사슬**을 1회 통과한다.
+# 단위 테스트로는 이음매가 안 잡힌다. 2026-09-15 에 ACTPolicy.name 을 "act" 로 바꿨다가
+# rollout 의 게이트 키(`success_rates["bc"]`)가 끊겨 8잡이 전부 죽었다. 이 단계가
+# 있었으면 2분에 잡혔다. 캠페인 40~60분을 버리기 전에 여기서 멈춘다.
+echo "### 0. 관통 스모크 (chunk=8, 1시드 x 2편)"
+$PY tools/repeat_runs.py \
+  --data datasets/sim_pick_cmd --target-sidecar command --tag _smoke_chunk8 --chunk 8 \
+  --runs 1 --epochs 1 --episodes 2 --seed-base 900 --eval-seed-base 9000 \
+  --action-space joint_delta_gripper_binary --cameras cam_wrist \
+  --device cuda --policy-device cpu || {
+    echo "✗ 스모크 실패. 캠페인을 돌리지 않는다."; exit 1;
+  }
+echo "### 스모크 통과 — 호출 사슬이 끝까지 돈다"
+
 echo "### 1. 큐 작성 (8조건)"
 # K 스윕 — command 타깃. 대조군은 chunk=1 command 9.3% [7.3, 11.9] n=600
 write_item chunk2_cmd   2 command -
