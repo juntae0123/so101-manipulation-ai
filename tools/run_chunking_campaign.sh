@@ -85,5 +85,9 @@ echo "### 3. 병렬 실행 — 전부 우리 카드(GPU 2)에. 8잡 x 808MiB ≈
 $PY tools/run_queue.py --parallel 8 --gpu 2 --allow-dirty
 
 echo "### 4. 전체 로그 합산"
-$PY tools/pool_rollouts.py out/logs
+# ⚠️ run_queue 는 로그를 out/queue_<시각>/ 에 쓴다. out/logs 를 보면 큐 결과가
+# 하나도 안 잡힌다 (2026-09-15 에 두 번 걸렸다). 가장 최근 큐 디렉터리를 쓴다.
+LATEST_QUEUE=$(ls -td out/queue_* 2>/dev/null | head -1)
+echo "큐 로그: $LATEST_QUEUE"
+$PY tools/pool_rollouts.py "$LATEST_QUEUE"
 echo "### 끝. out/ANALYSIS_latest.md 를 보라"

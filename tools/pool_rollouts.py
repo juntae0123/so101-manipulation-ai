@@ -19,6 +19,11 @@ from pathlib import Path
 ROW = re.compile(
     r"^\s*(\d+)\s+(\S+)\s+([\d.]+|nan)\s+([\d.]+)%\s+(\S+\.pt)\s*$"
 )
+# train_bc 가 매 실행 머리말에 찍는 기준선. **조건마다 다르다** — chunk=K 는 손실이
+# K 스텝에 걸쳐 계산돼 스케일이 다르고, 데이터셋마다 라벨 분포도 다르다.
+# 2026-09-15 에 고정 상수 2.55132 로 비교하다 chunk=8 조건 14건을 전부 오탐으로
+# 표시했다. 로그가 실제 값을 들고 있으니 그것을 읽는다.
+TRIVIAL = re.compile(r"자명한 예측기.*?=\s*([\d.]+)")
 N_PER_RUN = 100
 
 
@@ -41,8 +46,13 @@ def condition(ckpt: str) -> str:
 def main(argv: list[str]) -> int:
     logdir = Path(argv[1]) if len(argv) > 1 else Path("out/logs")
     rows: dict[str, dict[int, tuple[float, float]]] = defaultdict(dict)
+    trivial: dict[str, float] = {}
     for log in sorted(logdir.glob("*.log")):
-        for line in log.read_text(errors="replace").splitlines():
+        text = log.read_text(errors="replace")
+        # 이 로그가 스스로 찍은 기준선. 여러 시드가 같은 값을 찍으므로 첫 값을 쓴다.
+        tm = TRIVIAL.search(text)
+        base = float(tm.group(1)) if tm else float("nan")
+        for line in text.splitlines():
             m = ROW.match(line)
             if not m:
                 continue
@@ -50,6 +60,7 @@ def main(argv: list[str]) -> int:
             v = float("nan") if val == "nan" else float(val)
             # 같은 시드가 여러 로그에 있으면 마지막 것을 쓴다 (재실행분)
             rows[condition(ckpt)][int(seed)] = (v, float(pct))
+            trivial[condition(ckpt)] = base
 
     if not rows:
         print(f"!! 요약표 행을 못 찾았다: {logdir}/*.log")
@@ -79,14 +90,15 @@ def main(argv: list[str]) -> int:
     out.append("")
     out.append("## 자동 점검")
     out.append("")
-    TRIVIAL = 2.55132  # 자명한 예측기(항상 열어둠) 손실
     flagged = False
     for cond in sorted(rows):
+        base = trivial.get(cond, float("nan"))
         for s, (v, p) in sorted(rows[cond].items()):
-            if not math.isnan(v) and v > TRIVIAL * 0.9:
+            if not math.isnan(v) and not math.isnan(base) and v > base * 0.9:
                 out.append(
-                    f"- 🔴 `{cond}` 시드 {s}: val {v:.3f} 가 자명한 예측기"
-                    f"({TRIVIAL}) 수준이다. **학습 실패이지 조건 효과가 아니다**"
+                    f"- 🔴 `{cond}` 시드 {s}: val {v:.3f} 가 이 조건의 자명한 예측기"
+                    f"({base:.3f}) 수준이거나 그 이상이다. "
+                    f"**학습 실패이지 조건 효과가 아니다**"
                 )
                 flagged = True
             if math.isnan(v):
@@ -94,6 +106,11 @@ def main(argv: list[str]) -> int:
                 flagged = True
     if not flagged:
         out.append("- 자명한 예측기 수준 / nan 인 실행 없음")
+    out.append("")
+    out.append("조건별 자명한 예측기 손실 (로그에서 읽음):")
+    for cond in sorted(rows):
+        b = trivial.get(cond, float("nan"))
+        out.append(f"  - `{cond}`: {b:.5f}" if not math.isnan(b) else f"  - `{cond}`: 못 읽음")
 
     out.append("")
     out.append("## 읽는 법")
