@@ -40,13 +40,23 @@ fi
 
 echo "### 3. 학습 3시드 x 롤아웃 100편 — command 타깃, chunk 8"
 $PY tools/repeat_runs.py \
-  --data "$OUT" --target-sidecar command --tag dagger_cmd_chunk8 --chunk 8 \
+  --data "$OUT" --target-sidecar command --tag dagger_cmd_chunk8_v2 --chunk 8 \
   --runs 3 --epochs 30 --episodes 100 --seed-base 0 --eval-seed-base 3000 \
   --action-space joint_delta_gripper_binary --cameras cam_wrist \
   --device cuda --policy-device cpu --log && rc=0 || rc=$?
 # rc=1 은 배포 게이트 실패다. 결과이지 오류가 아니다.
 [ "$rc" -gt 1 ] && { echo "✗ 학습/평가 실패 (rc=$rc)"; exit 1; }
 
-echo "### 4. 합산"
+echo "### 4. 대조군 재측정 — 표준화 하한 수정(1e-8 -> RANGE_TOLERANCE)이 여기도 영향을 준다"
+# 같은 코드로 재지 않으면 DAgger 와 비교가 성립하지 않는다. 0915 에 이미 한 번
+# 겪었다 — grip_mid 수정 뒤 대조군이 9.3% 에서 8.0% 로 움직였다.
+$PY tools/repeat_runs.py \
+  --data datasets/sim_pick_cmd --target-sidecar command --tag ctrl_chunk8_v2 --chunk 8 \
+  --runs 3 --epochs 30 --episodes 100 --seed-base 0 --eval-seed-base 3000 \
+  --action-space joint_delta_gripper_binary --cameras cam_wrist \
+  --device cuda --policy-device cpu --log && rc=0 || rc=$?
+[ "$rc" -gt 1 ] && { echo "✗ 대조군 재측정 실패 (rc=$rc)"; exit 1; }
+
+echo "### 5. 합산"
 $PY tools/pool_rollouts.py out/logs
 echo "### 끝. out/ANALYSIS_latest.md"

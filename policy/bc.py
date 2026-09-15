@@ -37,6 +37,7 @@ import torch.nn as nn
 import yaml
 
 from paths import CONFIG_DIR, DEFAULT_CONFIG
+from contract.episode import RANGE_TOLERANCE
 from policy.base import check_action
 from sim.base import Observation
 
@@ -301,7 +302,13 @@ def target_scale(
     # constant target needs no scaling anyway.
     # 한 번도 안 움직인 관절은 std 가 0 이다. 그걸로 나누면 inf 가 되고, 상수 목표는
     # 애초에 스케일이 필요 없다.
-    std = torch.where(std < 1e-8, torch.ones_like(std), std)
+    # ⚠️ 2026-09-15 정정 — 하한이 1e-8 이었다. 계약의 RANGE_TOLERANCE 는 1e-4 이고,
+    # 그보다 작은 움직임은 **계약상 의미 없는 값**이다. 그런데 std 1e-5 인 축을
+    # 그대로 나누면 잔차가 1e5 배로 증폭된다. DAgger 데이터의 `wrist_roll` 이
+    # std 1e-05·90% 가 정확히 0 이었고, 그 한 축 때문에 표준화 손실이 12~14 로
+    # 터졌다 (자명한 예측기 1.66 의 7배). train 부터 발산했다 🟢.
+    # 움직이지 않는 축은 표준화하지 않는다 — 상수 목표에 스케일은 의미가 없다.
+    std = torch.where(std < RANGE_TOLERANCE, torch.ones_like(std), std)
     if action_space == "joint_delta_gripper_binary":
         # 그리퍼 채널은 0/1 라벨이고 헤드 출력은 로짓이다. 표준화하면 BCE 가 보는
         # 라벨이 0/1 이 아니게 되고 sigmoid 임계값이 뜻을 잃는다. 항등으로 둔다.
