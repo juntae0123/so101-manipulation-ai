@@ -333,7 +333,8 @@ def failure_shape(results: list[RolloutResult]) -> dict[str, Any] | None:
 
 def build_policies(
     env: MujocoPickEnv, replay_from: Path | None, policy_ckpt: Path | None = None,
-    device: str = "cpu",
+    device: str = "cpu", image_perturb: str | None = None,
+    image_perturb_sigma: float = 96.0,
 ) -> list[Policy]:
     """Assemble the baseline set, skipping replay if no episode is available.
     baseline 묶음을 만든다. 재생할 에피소드가 없으면 replay 는 건너뛴다.
@@ -363,6 +364,14 @@ def build_policies(
         print(f"학습 정책 로드: {bc.describe()}")
         if bc.meta.get("trained_on") == "random_tensors":
             print("⚠️ 이 체크포인트는 **랜덤 텐서로 학습**된 것이다. 평가 결과에 의미가 없다.")
+        if image_perturb is not None:
+            from policy.perturb import PerturbedObsPolicy
+
+            # baseline 은 감싸지 않는다. hold/zero 는 이미지를 안 보고, scripted 는
+            # 특권 정보를 쓰므로 교란해봐야 아무것도 말해주지 않는다.
+            bc = PerturbedObsPolicy(bc, mode=image_perturb, sigma=image_perturb_sigma)
+            print(f"⚠️ 추론 시점 이미지 교란: {image_perturb} "
+                  f"(sigma={image_perturb_sigma}). **학습은 정상 체크포인트다.**")
         policies.append(bc)
     if replay_from is not None:
         episodes = sorted(replay_from.glob("*.npz"))
@@ -396,6 +405,16 @@ def main() -> None:
                         help="학습 정책 체크포인트. baseline 과 같은 조건으로 함께 채점한다")
     parser.add_argument("--render", action="store_true",
                         help="render observations; needed only for vision policies")
+    # Inference-time image corruption. Training is untouched -- this answers
+    # "does the trained policy look at the image", not "can it learn from images".
+    # 추론 시점 이미지 교란. 학습은 건드리지 않는다 — 이것이 답하는 질문은
+    # "학습된 정책이 이미지를 보는가" 이지 "이미지로 배울 수 있는가" 가 아니다.
+    # `--image-noise`(학습 쪽)와 **다른 질문**이다. 0915 에 둘을 혼동했다.
+    parser.add_argument("--image-perturb", type=str, default=None,
+                        choices=["noise", "blackout", "freeze"],
+                        help="추론 시점에 정책이 받는 이미지를 망가뜨린다")
+    parser.add_argument("--image-perturb-sigma", type=float, default=96.0,
+                        help="--image-perturb noise 의 표준편차. 학습 쪽 기본값과 같다")
     parser.add_argument("--policy-device", type=str, default="cpu",
                         help="학습 정책 추론 장치. 기본 cpu — v2~v6 이력이 전부 cpu 라 "
                              "비교선을 유지한다. 바꾸면 conditions 에 기록되므로 "
@@ -437,7 +456,9 @@ def main() -> None:
 
     with MujocoPickEnv(cfg, render=args.render, object_jitter_m=args.jitter) as env:
         for policy in build_policies(env, args.replay_from, args.policy_ckpt,
-                                     device=args.policy_device):
+                                     device=args.policy_device,
+                                     image_perturb=args.image_perturb,
+                                     image_perturb_sigma=args.image_perturb_sigma):
             rate, results = evaluate(env, policy, seeds, object_xy)
             if policy.name == "bc":
                 action_space = getattr(policy, "action_space", "joint_absolute")
@@ -566,6 +587,14 @@ def main() -> None:
                 # "bc 가 25% 였다"는 발견이 아니다.
                 "policy_ckpt": str(args.policy_ckpt) if args.policy_ckpt else None,
                 "policy_action_space": action_space,
+                # ⚠️ 교란 조건이 여기 없으면 교란 실행과 정상 실행이 **같은
+                # policy_ckpt 로 조회돼 서로를 집어간다.** 0915 오전에 `train_bc`
+                # 기록에서 정확히 같은 버그를 겪었다 (8잡이 서로의 val_loss 를
+                # 가져갔다). 조건을 바꿨으면 조건에 적는다.
+                "image_perturb": args.image_perturb,
+                "image_perturb_sigma": (
+                    args.image_perturb_sigma if args.image_perturb else None
+                ),
                 "gates": GATES,
                 "policy_device": args.policy_device,
                 "reading_rules": {

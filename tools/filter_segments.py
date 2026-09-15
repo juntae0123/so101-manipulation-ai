@@ -47,11 +47,34 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="에피소드 길이 필터 (사이드카 포함)")
     ap.add_argument("--src", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--min-steps", type=int, required=True,
-                    help="이 틱 수 미만인 에피소드를 버린다")
+    ap.add_argument("--min-steps", type=int, default=0,
+                    help="이 틱 수 미만인 에피소드를 버린다. "
+                         "--chunk 와 함께 쓰면 둘 중 큰 쪽이 기준이 된다")
     ap.add_argument("--max-steps", type=int, default=0,
                     help="0 이 아니면 이 틱 수를 넘는 에피소드도 버린다")
+    # Valid anchors, not raw length, is what decides whether a segment can be used.
+    # 조각을 쓸 수 있는지 정하는 것은 길이가 아니라 **유효 anchor 수** 다.
+    #
+    # 유효 anchor 수 = L - H - K + 1
+    #   L = 조각 길이(틱) · H = 관측 history 스텝 수 · K = 행동 청크 길이
+    #
+    # ⚠️ H 는 경로마다 다르다. 계약 0.3.0 은 단일 프레임이라 H=1,
+    # 트랙 A 의 `umi_relative_chunk` 는 history 2스텝이라 H=2 다 (0915 합의).
+    # 기본값을 1 로 두되 인자로 받는 이유가 이것이다 — 한쪽 값을 코드에 박으면
+    # 다른 경로가 조용히 틀린 기준으로 걸러진다.
+    ap.add_argument("--chunk", type=int, default=0,
+                    help="행동 청크 길이 K. 주면 유효 anchor >= 1 을 기준으로 거른다")
+    ap.add_argument("--obs-history", type=int, default=1,
+                    help="관측 history 스텝 수 H. 계약 0.3.0 은 1, v6 는 2")
     args = ap.parse_args()
+
+    if args.chunk < 0 or args.obs_history < 1:
+        raise SystemExit("--chunk 는 0 이상, --obs-history 는 1 이상이어야 한다")
+    need = args.min_steps
+    if args.chunk:
+        need = max(need, args.obs_history + args.chunk)
+    if need <= 0:
+        raise SystemExit("--min-steps 또는 --chunk 중 하나는 줘야 한다")
 
     npzs = sorted(args.src.glob("*.npz"))
     if not npzs:
@@ -60,16 +83,37 @@ def main() -> int:
 
     lengths = {f: episode_steps(f) for f in npzs}
     keep = [f for f, n in lengths.items()
-            if n >= args.min_steps and (args.max_steps == 0 or n <= args.max_steps)]
+            if n >= need and (args.max_steps == 0 or n <= args.max_steps)]
     drop = [f for f in npzs if f not in keep]
 
-    print(f"{args.src}: {len(npzs)}편")
-    print(f"  유지 {len(keep)}편 · 버림 {len(drop)}편 "
-          f"(기준 {args.min_steps} 이상"
-          + (f", {args.max_steps} 이하" if args.max_steps else "") + ")")
+    def anchors(n: int) -> int:
+        """Usable anchors in a segment of n ticks, clamp/padding forbidden.
+        n 틱 조각에서 쓸 수 있는 anchor 수. 클램프·패딩을 쓰지 않는다는 전제다."""
+        if not args.chunk:
+            return n
+        return max(0, n - args.obs_history - args.chunk + 1)
+
+    kept_ticks = sum(lengths[f] for f in keep)
+    drop_ticks = sum(lengths[f] for f in drop)
+    kept_anchors = sum(anchors(lengths[f]) for f in keep)
+
+    # 전체·채택·폐기를 전부 찍는다. 부분만 찍으면 어디로 샜는지 알 수 없다.
+    print(f"{args.src}")
+    print(f"  기준  길이 >= {need}"
+          + (f"  (H={args.obs_history} + K={args.chunk})" if args.chunk else "")
+          + (f", <= {args.max_steps}" if args.max_steps else ""))
+    print(f"  세그먼트  전체 {len(npzs)} = 채택 {len(keep)} + 폐기 {len(drop)}")
+    print(f"  틱        전체 {kept_ticks + drop_ticks} = 채택 {kept_ticks} "
+          f"+ 폐기 {drop_ticks}")
+    if args.chunk:
+        print(f"  유효 anchor  채택분 합계 {kept_anchors}"
+              f" (클램프·패딩 사용: false)")
     if drop:
         dl = sorted(lengths[f] for f in drop)
-        print(f"  버린 길이: 최소 {dl[0]} · 중앙 {dl[len(dl) // 2]} · 최대 {dl[-1]}")
+        print(f"  폐기 길이  최소 {dl[0]} · 중앙 {dl[len(dl) // 2]} · 최대 {dl[-1]}")
+    if len(keep) + len(drop) != len(npzs):
+        print("!! 세그먼트 합이 안 맞는다")
+        return 1
     if not keep:
         print("!! 남는 에피소드가 없다. 기준을 다시 보라")
         return 1
