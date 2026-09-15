@@ -145,6 +145,9 @@ def run_conditions(args: Any, train_seeds: list[int] | None = None) -> dict[str,
         # 학습 타깃 사이드카. 이게 표류 검사 밖에 있으면 **타깃이 다른 두 실행이
         # "동일 조건"으로 보고된다** — 오늘 가른 바로 그 축이다.
         "target_sidecar": getattr(args, "target_sidecar", None),
+        # 청크 길이. 표류 검사 밖에 있으면 K 가 다른 두 실행이 "동일 조건" 으로
+        # 보고된다 — target_sidecar 와 같은 이유다.
+        "chunk": getattr(args, "chunk", 1),
         "train_config_sha": file_digest(DEFAULT_TRAIN_CONFIG),
         "gate": {"rollout": ROLLOUT_GATE, "min_runs": GATE_MIN_RUNS},
     }
@@ -170,6 +173,7 @@ def repeat(
     action_space: str | None = None,
     cameras: str | None = None,
     target_sidecar: str | None = None,
+    chunk: int = 1,
 ) -> list[RunResult]:
     """Train `runs` times, score each, and collect the results.
     `runs` 회 학습하고 각각 채점해 결과를 모은다."""
@@ -200,6 +204,10 @@ def repeat(
         # 평가는 타깃과 무관하다 — 정책이 낸 행동을 씬이 그대로 받는다.
         if target_sidecar is not None:
             train_cmd += ["--target-sidecar", target_sidecar]
+        # 행동 청크 길이. 평가 쪽은 인자를 받지 않는다 — 체크포인트 메타의 chunk 가
+        # 정책 클래스를 고른다(policy/act.py load_policy). 학습과 평가가 갈릴 수 없다.
+        if int(chunk) != 1:
+            train_cmd += ["--chunk", str(int(chunk))]
         _run(train_cmd)
         # `--policy-device` 를 자식에게 넘긴다. 안 넘기면 repeat_runs 의 conditions 에는
         # 기록되는데 실제 평가는 eval_rollout 기본값으로 돌아 **기록과 실행이 갈린다.**
@@ -311,6 +319,11 @@ def main() -> int:
         help="학습 타깃을 ep_XXXXX.NAME.npy 에서 읽는다 (예: command, lead8). "
              "계약 npz 는 건드리지 않는다. train_bc 로 전달",
     )
+    parser.add_argument(
+        "--chunk", type=int, default=1, metavar="K",
+        help="행동 청크 길이. train_bc 로 전달된다. 1 이면 기존 BC 와 비트 동일 "
+             "(policy/act.py G0). 평가는 체크포인트 메타에서 K 를 읽는다",
+    )
     parser.add_argument("--log", action="store_true")
     args = parser.parse_args()
 
@@ -353,6 +366,7 @@ def main() -> int:
         action_space=args.action_space,
         cameras=args.cameras,
         target_sidecar=args.target_sidecar,
+        chunk=args.chunk,
     )
     summary = summarise(results)
 
