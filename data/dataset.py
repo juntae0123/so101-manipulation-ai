@@ -51,12 +51,20 @@ class EpisodeDataset(Dataset):
         camera_names: list[str] | None = None,
         strict: bool = True,
         target_sidecar: str | None = None,
+        chunk: int = 1,
     ) -> None:
         # 계약의 `action` 대신 사이드카 배열을 학습 타깃으로 쓴다 (검증용).
         # 계약 0.3.0 은 action[t]=state[t+1] 이라 "이미 간 거리"가 타깃이 된다.
-        # 그 규약이 학습을 무력화하는지 가르기 위해, 수집기가 남긴 command(=ctrl)를
+        # 그 규약이 학습을 무력화하는지 가르기 위해, 수집기가 남긴 `command`(=ctrl)를
         # 타깃으로 바꿔 학습할 수 있어야 한다. 계약 파일은 건드리지 않는다.
         self.target_sidecar = target_sidecar
+        # 행동 청크 길이. 1 이면 기존과 완전히 같은 (B, 6) 타깃을 낸다 — 청킹 구현이
+        # 기존 BC 를 바꾸지 않았음을 확인하는 계측기 검증(G0)이 여기 걸린다.
+        # 에피소드 끝에서 K 스텝이 모자라면 **마지막 값으로 클램프**한다. 자르면
+        # 샘플 수가 K 에 따라 변해 조건 간 비교가 깨진다.
+        if int(chunk) < 1:
+            raise ValueError(f"chunk 는 1 이상이어야 한다: {chunk}")
+        self.chunk = int(chunk)
         self.targets: list[Any] = []
         self.root = Path(root)
         files = sorted(self.root.glob("*.npz"))
@@ -157,9 +165,13 @@ class EpisodeDataset(Dataset):
             images[cam] = (arr - self.mean) / self.std
         state = torch.from_numpy(ep.state[t].astype(np.float32))
         src = self.targets[ep_i]
-        action = torch.from_numpy(
-            (ep.action[t] if src is None else src[t]).astype(np.float32)
-        )
+        arr = ep.action if src is None else src
+        if self.chunk == 1:
+            action = torch.from_numpy(arr[t].astype(np.float32))
+        else:
+            n = arr.shape[0]
+            idx = np.minimum(np.arange(t, t + self.chunk), n - 1)
+            action = torch.from_numpy(arr[idx].astype(np.float32))
         return images, state, action
 
     def set_image_noise(self, gray_levels: float, train_indices: list[int] | None) -> None:
@@ -180,6 +192,7 @@ class EpisodeDataset(Dataset):
             f"{self.root.name}: 에피소드 {len(self.episodes)}개, "
             f"샘플 {len(self.index)}개, 카메라 {self.camera_names}"
             + (f", 타깃=사이드카 {self.target_sidecar}" if self.target_sidecar else "")
+            + (f", 청크 {self.chunk}" if self.chunk > 1 else "")
             + (f", 계약위반으로 제외 {len(self.rejected)}개" if self.rejected else "")
         )
 

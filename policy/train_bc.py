@@ -35,6 +35,12 @@ from torch.utils.data import DataLoader, Subset
 
 from contract.episode import CONTRACT_VERSION
 from data.dataset import EpisodeDataset, RandomTensorDataset, collate
+from policy.act import (
+    ACTCheckpointMeta,
+    ACTNet,
+    chunk_target_scale,
+    save_act_checkpoint,
+)
 from paths import AI_ROOT, DEFAULT_CONFIG
 from policy.bc import (
     BCNet,
@@ -185,6 +191,17 @@ def split_by_episode(
     return tr, va, sorted(val_eps)
 
 
+def _stats_list(t: "torch.Tensor | None") -> list | None:
+    """Target statistics as nested lists. Handles both (D,) and (K, D).
+    타깃 통계를 중첩 리스트로. (D,) 와 (K, D) 를 모두 받는다.
+
+    청크 학습은 스텝별로 스케일을 재므로 (K, D) 다. 이 값이 없으면 체크포인트의
+    원 출력을 행동으로 되돌릴 수 없다."""
+    if t is None:
+        return None
+    return t.detach().cpu().tolist()
+
+
 @dataclass
 class TargetTransform:
     """The one place that decides what the loss is computed against.
@@ -217,6 +234,10 @@ class TargetTransform:
     def __call__(self, action: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
         """Actions and states in, the tensor the loss sees out.
         행동·상태를 받아 손실이 보는 텐서를 낸다."""
+        # 청크 타깃 (B, K, D) 이면 state (B, D) 를 앵커로 브로드캐스트한다.
+        # 모든 스텝이 **같은 현재 상태**를 기준으로 한다 — policy/act.py 의 앵커 규약.
+        if action.ndim == 3 and state.ndim == 2:
+            state = state.unsqueeze(1)
         target = training_target(action, state, self.action_space, self.grip_mid)
         if self.mean is not None and self.std is not None:
             target = (target - self.mean) / self.std
@@ -227,7 +248,12 @@ class TargetTransform:
         통계를 학습 디바이스로 옮긴다."""
         if self.mean is None or self.std is None:
             return self
-        return TargetTransform(self.action_space, self.mean.to(device), self.std.to(device))
+        # ⚠️ 2026-09-15 정정 — 여기서 `grip_mid` 를 빠뜨리고 있었다. `--device cuda`
+        # 학습은 전부 이 경로를 지나므로, 데이터에서 파생한 그리퍼 임계값이 버려지고
+        # 시뮬 설정 파생값으로 되돌아갔다. 실데이터에서는 틀린 임계값으로 이진화된다.
+        return TargetTransform(
+            self.action_space, self.mean.to(device), self.std.to(device), self.grip_mid
+        )
 
     @property
     def standardised(self) -> bool:
@@ -310,6 +336,11 @@ def main() -> int:
         help="쉼표로 구분한 카메라 이름. 데이터셋 카메라의 **부분집합**만 쓴다. "
              "예: --cameras cam_wrist (실물 배포 구성. L76)",
     )
+    parser.add_argument(
+        "--chunk", type=int, default=1, metavar="K",
+        help="행동 청크 길이. 한 관측에서 K 스텝을 예측하고 K 스텝에 걸쳐 실행한다. "
+             "1 이면 기존 BC 와 완전히 동일하다 (policy/act.py 의 G0 로 검증)",
+    )
     parser.add_argument("--log", action="store_true")
     args = parser.parse_args()
 
@@ -333,6 +364,10 @@ def main() -> int:
         dataset: Any = RandomTensorDataset(args.random, cfg, cameras, seed=seed)
         trained_on = "random_tensors"
         n_episodes = 0
+        if args.chunk != 1:
+            raise SystemExit(
+                "--random 은 청크 타깃을 만들지 않는다. --chunk 는 --data 와 함께 쓴다"
+            )
         print("⚠️ 랜덤 텐서로 학습한다. **손실 값에 의미가 없다.**")
         print("   확인하는 것은 루프가 끝까지 도는가 하나뿐이다.\n")
     else:
@@ -341,7 +376,8 @@ def main() -> int:
             if args.cameras else None
         )
         dataset = EpisodeDataset(args.data, cfg, camera_names=cam_override,
-                                 target_sidecar=args.target_sidecar)
+                                 target_sidecar=args.target_sidecar,
+                                 chunk=args.chunk)
         cameras = dataset.camera_names
         if cam_override is not None:
             print(f"· 카메라 덮어쓰기: {cameras} (데이터셋은 건드리지 않았다)")
@@ -417,7 +453,9 @@ def main() -> int:
         # 그대로 나오므로 기존 수치가 바뀌지 않는다 — tools/check_gripper_norms.py 가 검정한다.
         if space == "joint_delta_gripper_binary":
             g = gripper_index()
-            grip_open_norm, grip_close_norm, grip_mid = gripper_norms_from_data(acts[:, g])
+            grip_open_norm, grip_close_norm, grip_mid = gripper_norms_from_data(
+                acts[..., g].reshape(-1)
+            )
             print(f"그리퍼 규약 (데이터에서 파생): 열림 {grip_open_norm:+.4f} · "
                   f"닫힘 {grip_close_norm:+.4f} · 임계값 {grip_mid:+.4f}")
             ref_o, ref_c = gripper_command_norms()
@@ -425,9 +463,14 @@ def main() -> int:
             if abs(grip_mid - ref_mid) > 0.02:
                 print(f"  ⚠️ 설정 파생 임계값({ref_mid:+.4f})과 {abs(grip_mid - ref_mid):.4f} 다르다 — "
                       f"**시뮬과 다른 그리퍼 규약의 데이터다.** 이 체크포인트를 시뮬 수치와 나란히 놓지 마라")
-        raw_target = training_target(acts, sts, space, grip_mid)
+        # 청크 타깃이면 앵커 상태를 브로드캐스트한다 (TargetTransform 과 같은 규약).
+        _sts = sts.unsqueeze(1) if acts.ndim == 3 else sts
+        raw_target = training_target(acts, _sts, space, grip_mid)
         if bool(t.get("normalize_target", True)):
-            t_mean, t_std = target_scale(raw_target, space)
+            t_mean, t_std = (
+                chunk_target_scale(raw_target, space) if raw_target.ndim == 3
+                else target_scale(raw_target, space)
+            )
         # Built here and used by BOTH passes. The baseline below is computed
         # through the same object, so the epoch losses and the reference they are
         # read against cannot end up in different units.
@@ -456,8 +499,8 @@ def main() -> int:
         baseline_norm = float(scaled.abs().mean())
         if space == "joint_delta_gripper_binary":
             g = gripper_index()
-            closed = float(raw_target[:, g].sum())
-            opened = float(raw_target.shape[0]) - closed
+            closed = float(raw_target[..., g].sum())
+            opened = float(raw_target[..., g].numel()) - closed
             if closed < 1.0:
                 raise ValueError(
                     "이진 라벨에 닫힘 프레임이 없다. "
@@ -466,18 +509,19 @@ def main() -> int:
             # 데이터에서 파생되는 통계다. 손으로 고르는 하이퍼파라미터가 아니다.
             grip_pos_weight = opened / closed
             print(f"그리퍼 이진 라벨: 닫힘 {closed:.0f} / 열림 {opened:.0f} "
-                  f"({closed / raw_target.shape[0]:.1%}) · "
+                  f"({closed / raw_target[..., g].numel():.1%}) · "
                   f"pos_weight {grip_pos_weight:.3f} (데이터에서 계산)")
             # 자명한 예측기를 "항상 0" 이 아니라 **항상 열어둠** 으로 바꾼다.
             # 이 공간에서 이기고 싶은 상대가 그것이다 — v5 는 100편 중 42편에서
             # 그리퍼를 한 번도 닫지 않았다 🟢 2026-09-10.
             ref = make_loss(str(t["loss"]), space, grip_pos_weight)
             trivial = torch.zeros_like(scaled)
-            trivial[:, g] = -4.0
+            trivial[..., g] = -4.0
             baseline_norm = float(ref(trivial, scaled))
             trivial_label = "항상 열어둠"
 
-    model = BCNet(cameras, cfg).to(device)
+    # chunk=1 이면 ACTNet 은 BCNet 과 구조·파라미터·초기가중치가 같다 (policy/act.py G0).
+    model = ACTNet(cameras, cfg, chunk=args.chunk).to(device)
     target_fn = target_fn.to(device)
     if t_mean is not None:
         t_mean, t_std = t_mean.to(device), t_std.to(device)
@@ -539,12 +583,11 @@ def main() -> int:
         mark = ""
         if loaders["val"] is not None and va < best:
             best = va
-            save_checkpoint(best_out, model, CheckpointMeta(
+            save_act_checkpoint(best_out, model, ACTCheckpointMeta(
                 camera_names=list(cameras), contract_version=CONTRACT_VERSION,
-                action_space=model.action_space,
+                action_space=model.action_space, chunk=args.chunk,
                 gripper_open_norm=grip_open_norm, gripper_close_norm=grip_close_norm,
-                target_mean=[float(v) for v in t_mean.cpu()] if t_mean is not None else None,
-                target_std=[float(v) for v in t_std.cpu()] if t_std is not None else None,
+                target_mean=_stats_list(t_mean), target_std=_stats_list(t_std),
                 train_config=cfg, config_sha=file_digest(DEFAULT_CONFIG),
                 code_sha=code_digest(), n_params=n_params, n_episodes=n_episodes,
                 n_samples=len(dataset), epochs_run=ep, best_val_loss=best,
@@ -565,12 +608,11 @@ def main() -> int:
     # 체크포인트 선택을 그것이 하고 있었다. val 곡선이 평평하면 임의의 이른 epoch 이
     # 뽑힌다. 실측: 200 epoch 실행이 epoch 1 모델을 저장했고, "정책을 평가"한 롤아웃이
     # 학습되지 않은 신경망을 평가했다.
-    save_checkpoint(out, model, CheckpointMeta(
+    save_act_checkpoint(out, model, ACTCheckpointMeta(
             camera_names=list(cameras), contract_version=CONTRACT_VERSION,
-            action_space=model.action_space,
+            action_space=model.action_space, chunk=args.chunk,
             gripper_open_norm=grip_open_norm, gripper_close_norm=grip_close_norm,
-            target_mean=[float(v) for v in t_mean.cpu()] if t_mean is not None else None,
-            target_std=[float(v) for v in t_std.cpu()] if t_std is not None else None,
+            target_mean=_stats_list(t_mean), target_std=_stats_list(t_std),
             train_config=cfg, config_sha=file_digest(DEFAULT_CONFIG),
             code_sha=code_digest(), n_params=n_params, n_episodes=n_episodes,
             n_samples=len(dataset), epochs_run=epochs, best_val_loss=best,

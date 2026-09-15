@@ -347,7 +347,7 @@ def build_policies(
     """
     policies: list[Policy] = [HoldPolicy(), ZeroPolicy(), ScriptedPickPolicy(env)]
     if policy_ckpt is not None:
-        from policy.bc import BCPolicy
+        from policy.act import load_policy
 
         # `BCPolicy` defaults to cpu, and nothing recorded which device an
         # evaluation ran on. Every logged BC rollout from v2 to v6 was therefore
@@ -358,7 +358,8 @@ def build_policies(
         # 기록되지 않았다. 그래서 v2~v6 의 모든 BC 롤아웃이 CPU 추론이었고 기록에는
         # 그 말이 없다 🟢 2026-09-07. 실측 차이는 100편에 1편 정도로 우리가 쓰는 모든
         # 구간 안에 들어가지만, **작다는 것과 적혀 있다는 것은 다르다.**
-        bc = BCPolicy(policy_ckpt, device=device)
+        # 청크 길이는 체크포인트가 정한다 — 호출자가 정하면 학습과 평가가 갈린다.
+        bc = load_policy(policy_ckpt, device=device)
         print(f"학습 정책 로드: {bc.describe()}")
         if bc.meta.get("trained_on") == "random_tensors":
             print("⚠️ 이 체크포인트는 **랜덤 텐서로 학습**된 것이다. 평가 결과에 의미가 없다.")
