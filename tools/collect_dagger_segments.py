@@ -13,6 +13,7 @@ runtime_limits.torch_threads()
 import numpy as np
 
 from contract.episode import (
+    CAMERA_NAMES,
     ACTION_DIM,
     CONTRACT_VERSION,
     RANGE_TOLERANCE,
@@ -107,7 +108,14 @@ def main() -> int:
         object_jitter_m=0.05,
         max_ticks=200,
     ) as env:
-        cameras = env.camera_names
+        # 계약 0.3.0 은 cam_wrist 한 대다 (D-AI-46). 씬은 2대 그대로 두고 기록만
+        # 거른다 — configs/so101.yaml 은 양 트랙 공유 파일이라 건드리지 않는다.
+        # data/collect.py 와 같은 규약이다.
+        cameras = [c for c in env.camera_names if c in CAMERA_NAMES]
+        if not cameras:
+            raise RuntimeError(
+                f"계약 카메라가 씬에 없다: {CAMERA_NAMES} vs {list(env.camera_names)}"
+            )
         expert = ScriptedFeedbackPolicy(env)
 
         for episode_index in range(args.episodes):
