@@ -25,6 +25,7 @@ from contract.episode import (
 )
 from policy.baselines import ScriptedFeedbackPolicy
 from policy.bc import BCPolicy
+from policy.act import load_policy
 from sim.mujoco.build_scene import DEFAULT_CONFIG
 from sim.mujoco.env import MujocoPickEnv
 from tracking.exp_log import _git_rev, file_digest, log_run
@@ -94,7 +95,7 @@ def main() -> int:
         raise FileExistsError(args.out)
     args.out.mkdir(parents=True)
 
-    policies = [BCPolicy(path, device="cpu") for path in args.policy_ckpt]
+    policies = [load_policy(path, device="cpu") for path in args.policy_ckpt]
     stats: Counter = Counter()
     phase_invalid: Counter = Counter()
     max_state_excess = 0.0

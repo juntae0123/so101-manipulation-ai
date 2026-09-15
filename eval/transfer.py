@@ -146,9 +146,9 @@ def _policies(
     # 프로브이고 렌더 시간의 절반을 먹으므로, 확인된 이상 뺄 수 있다.
     out: list[Policy] = [ScriptedPickPolicy(env)] if with_scripted else []
     if policy_ckpt is not None:
-        from policy.bc import BCPolicy
+        from policy.act import load_policy
 
-        bc = BCPolicy(policy_ckpt)
+        bc = load_policy(policy_ckpt)
         if bc.meta.get("trained_on") == "random_tensors":
             raise SystemExit(
                 "이 체크포인트는 랜덤 텐서로 학습된 것이다. 전이 붕괴율을 재도 "

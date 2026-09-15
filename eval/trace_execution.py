@@ -35,6 +35,7 @@ import numpy as np
 
 from contract.episode import read_episode
 from policy.bc import BCPolicy
+from policy.act import load_policy
 from sim.base import Observation
 from sim.mujoco.build_scene import DEFAULT_CONFIG, load_config
 from sim.mujoco.env import MujocoPickEnv
@@ -157,7 +158,7 @@ def main() -> int:
         print(f"  [{k}] {v}")
     print(f"\n대상: {args.episode.name} · {len(ep.action)} 스텝 · 물체 ({xy[0]:+.4f}, {xy[1]:+.4f})")
 
-    policy = BCPolicy(args.policy_ckpt)
+    policy = load_policy(args.policy_ckpt)
     print(f"정책: {policy.describe()}\n")
 
     with MujocoPickEnv(cfg, render=True, object_jitter_m=0.0) as env:
