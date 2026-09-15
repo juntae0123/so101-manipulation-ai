@@ -218,7 +218,10 @@ def repeat(
               "--policy-ckpt", str(ckpt), "--log"])
 
         roll = _latest_record("rollout_baselines", {"policy_ckpt": str(ckpt)})
-        train = _latest_record("train_bc", {"trained_on": str(data), "seed": seed})
+        # ⚠️ 2026-09-15 정정 — (trained_on, seed) 로 찾으면 **병렬 실행에서 남의 기록을
+        # 집어간다.** 체크포인트 경로는 tag 를 포함해 조건마다 유일하다. 롤아웃 기록은
+        # 원래 policy_ckpt 로 찾고 있었고, 그래서 성공률은 오염되지 않았다.
+        train = _latest_record("train_bc", {"out": str(ckpt)})
         if roll is None:
             raise SystemExit(
                 f"EXP_LOG 에서 {ckpt.name} 의 롤아웃 기록을 찾지 못했다. "

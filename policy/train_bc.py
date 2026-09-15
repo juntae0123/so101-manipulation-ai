@@ -640,6 +640,12 @@ def main() -> int:
                 "split_by": split_by, "val_fraction": val_fraction,
                 "val_episodes": val_episodes,
                 "lr": t["lr"], "loss": t["loss"], "seed": seed, "device": str(device),
+                # ⚠️ 2026-09-15 추가 — 체크포인트 경로. 이게 없어서 `eval/repeat.py` 가
+                # (trained_on, seed) 만으로 학습 기록을 찾았고, **같은 데이터·같은 시드로
+                # 8잡을 병렬로 돌리자 서로의 val_loss 를 집어갔다.** 조건마다 val 이
+                # 소수점 5자리까지 같게 나온 것이 그 증상이다.
+                "out": str(out),
+                "chunk": args.chunk,
                 "encoder_mode": cfg["model"]["encoder_mode"],
                 "action_space": model.action_space,
                 "normalize_target": t_std is not None,

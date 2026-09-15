@@ -175,6 +175,16 @@ def main() -> int:
 
             for local_segment_index, segment in enumerate(segments):
                 n = len(segment["state"])
+                # 계약 0.3.0 은 action[t] = state[t+1] 을 강제한다 (validate).
+                # 그런데 전문가가 내린 명령(label)은 그것과 다른 값이고, **학습에
+                # 쓸모 있는 것은 그쪽이다** — 0914 확정 🟢: state[t+1] 타깃은
+                # 0/300, ctrl 타깃은 22/300. 그래서 계약 action 은 규약대로 만들고
+                # 명령은 사이드카로 따로 남긴다. 계약 npz 는 건드리지 않는다.
+                state_arr = np.stack(segment["state"]).astype(np.float32)
+                command_arr = np.stack(segment["action"]).astype(np.float32)
+                action_arr = np.vstack(
+                    [state_arr[1:], state_arr[-1:]]
+                ).astype(np.float32)
                 episode_id = (
                     f"dagger_seg_{episode_index:05d}_{local_segment_index:03d}"
                 )
@@ -212,9 +222,9 @@ def main() -> int:
                         camera: np.stack(frames).astype(np.uint8)
                         for camera, frames in segment["images"].items()
                     },
-                    state=np.stack(segment["state"]).astype(np.float32),
+                    state=state_arr,
                     state_timestamp=timestamps,
-                    action=np.stack(segment["action"]).astype(np.float32),
+                    action=action_arr,
                     action_timestamp=timestamps.copy(),
                 )
                 problems = validate(ep)
@@ -222,7 +232,11 @@ def main() -> int:
                     raise RuntimeError(
                         f"{episode_id} contract violation: {problems}"
                     )
-                write_episode(ep, args.out)
+                path = write_episode(ep, args.out)
+                # 사이드카: 전문가가 내린 명령. `read_episode` 도 `validate` 도
+                # 이 파일을 보지 않으므로 계약은 그대로다.
+                # 학습은 `train_bc.py --target-sidecar command` 로 집어 쓴다.
+                np.save(path.with_suffix(".command.npy"), command_arr)
                 stats["stored_ticks"] += n
                 stats["segments"] += 1
                 segment_index += 1
