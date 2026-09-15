@@ -38,9 +38,39 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=Path("out"))
     parser.add_argument("--author", type=str, default="김준태(트랙B)")
     parser.add_argument("--log", action="store_true")
+    # Which hardware config to scan. ver1 has a different TCP and jaw axis, so its
+    # reachable area is a different measurement -- not an update of the old one.
+    # 어느 하드웨어 설정으로 훑을지. ver1 은 TCP 와 jaw 축이 달라서 도달영역이
+    # **다른 측정**이다. 옛 수치의 갱신이 아니다. 기본값은 레거시 씬 그대로 둔다 --
+    # 기존 sim_pick_* 수치가 그 설정에서 나왔기 때문이다.
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
+                        help="하드웨어 설정 yaml. 기본 configs/so101.yaml")
+    # Only the `grasp` block is overridable, and only from a file. A CLI number
+    # would not be recorded anywhere a later reader can find it.
+    # `grasp` 블록만, 파일로만 덮어쓴다. CLI 숫자로 받으면 나중에 읽는 사람이
+    # 그 값을 찾을 곳이 없다. 파일이면 해시가 EXP_LOG 에 남는다.
+    parser.add_argument("--grasp-override", type=Path, default=None,
+                        help="grasp 블록만 덮어쓸 yaml (예: configs/grasp_so101_ver1.yaml)")
     args = parser.parse_args()
 
-    cfg = load_config()
+    if not args.config.exists():
+        raise SystemExit(f"설정 파일이 없다: {args.config}")
+    cfg = load_config(args.config)
+    override_sha = ""
+    if args.grasp_override is not None:
+        if not args.grasp_override.exists():
+            raise SystemExit(f"grasp 덮어쓰기 파일이 없다: {args.grasp_override}")
+        ov = load_config(args.grasp_override)
+        if "grasp" not in ov or not isinstance(ov["grasp"], dict):
+            raise SystemExit("덮어쓰기 파일에 최상위 `grasp:` 매핑이 없다")
+        unknown = set(ov["grasp"]) - set(cfg["grasp"])
+        # 오타가 조용히 무시되면 "덮어썼다고 믿는 채로" 옛 값으로 측정한다.
+        if unknown:
+            raise SystemExit(f"grasp 에 없는 키다 (오타?): {sorted(unknown)}")
+        for k, v in ov["grasp"].items():
+            print(f"  grasp.{k}: {cfg['grasp'][k]} -> {v}")
+        cfg["grasp"].update(ov["grasp"])
+        override_sha = file_digest(args.grasp_override)
     model = build_model(cfg)
     g = cfg["grasp"]
     offset = np.asarray(g["pinch_offset_local"], dtype=float)
@@ -112,7 +142,12 @@ def main() -> None:
                 "y_range": list(args.y_range),
                 "step_m": args.step,
                 "grasp_height_m": z,
-                "config_sha": file_digest(DEFAULT_CONFIG),
+                "config": str(args.config),
+                "config_sha": file_digest(args.config),
+                "grasp_override": str(args.grasp_override or ""),
+                "grasp_override_sha": override_sha,
+                "pinch_offset_local": [float(v) for v in offset],
+                "approach_axis": [float(v) for v in axis],
                 "criterion": "pos_err<5mm AND axis_err<5deg AND 반복 중 관절한계에 걸리지 않음",
                 "wrist_roll": args.wrist_roll,
             },
