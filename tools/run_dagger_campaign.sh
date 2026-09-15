@@ -66,7 +66,8 @@ write_item v2_mix_c1     datasets/mix_cmd       1 command -
 write_item v2_mix_c8     datasets/mix_cmd       8 command -
 # 이미지 어블레이션 — 혼합이 이미지를 쓰는가
 write_item v2_mix_c8_n96 datasets/mix_cmd       8 command 96
-# 계약 action 타깃 대조 (v6 대리)
+# 계약 action 타깃 대조. ⚠️ v6 대리가 아니다 — v6 는 state[t] 앵커 상대궤적,
+# 이 조건은 계약 절대 관절각이다 (0915 정정)
 write_item v2_mix_traj_c8 datasets/mix_cmd      8 -       -
 
 echo "### 3. 큐 검증"
