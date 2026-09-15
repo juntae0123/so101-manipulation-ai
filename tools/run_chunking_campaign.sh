@@ -55,10 +55,15 @@ $PY tools/repeat_runs.py \
   --data datasets/sim_pick_cmd --target-sidecar command --tag _smoke_chunk8 --chunk 8 \
   --runs 1 --epochs 1 --episodes 2 --seed-base 900 --eval-seed-base 9000 \
   --action-space joint_delta_gripper_binary --cameras cam_wrist \
-  --device cuda --policy-device cpu || {
-    echo "✗ 스모크 실패. 캠페인을 돌리지 않는다."; exit 1;
-  }
-echo "### 스모크 통과 — 호출 사슬이 끝까지 돈다"
+  --device cuda --policy-device cpu && rc=0 || rc=$?
+# ⚠️ rc=1 은 **배포 게이트 실패**다. 실행 오류가 아니다 (run_queue.py 와 같은 규약).
+# 1epoch·2편짜리 스모크가 게이트 20% 를 넘을 리 없다. 여기서 보는 것은 성능이 아니라
+# **호출 사슬이 끝까지 도는가** 하나다.
+if [ "$rc" -gt 1 ]; then
+  echo "✗ 스모크 실패 (rc=$rc). 캠페인을 돌리지 않는다."
+  exit 1
+fi
+echo "### 스모크 통과 (rc=$rc) — 호출 사슬이 끝까지 돈다"
 
 echo "### 1. 큐 작성 (8조건)"
 # K 스윕 — command 타깃. 대조군은 chunk=1 command 9.3% [7.3, 11.9] n=600
