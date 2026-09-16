@@ -13,6 +13,7 @@ BC 정책을 학습한다. 실데이터가 있기 전에 랜덤 텐서로 루프
 from __future__ import annotations
 
 import argparse
+import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -341,6 +342,12 @@ def main() -> int:
         help="행동 청크 길이. 한 관측에서 K 스텝을 예측하고 K 스텝에 걸쳐 실행한다. "
              "1 이면 기존 BC 와 완전히 동일하다 (policy/act.py 의 G0 로 검증)",
     )
+    # Bit-for-bit reproducibility is opt-in because it costs speed. Without it the
+    # run is still seeded -- it is just not guaranteed to repeat on GPU.
+    # 비트 단위 재현은 속도를 깎으므로 옵트인이다. 끄더라도 시드는 걸려 있고,
+    # 다만 GPU 에서 반복이 **보장되지 않을** 뿐이다.
+    parser.add_argument("--deterministic", action="store_true",
+                        help="cudnn 결정론 모드. 느리다. 재현이 필요한 실행에만")
     parser.add_argument("--log", action="store_true")
     args = parser.parse_args()
 
@@ -352,8 +359,24 @@ def main() -> int:
     epochs = int(args.epochs if args.epochs is not None else t["epochs"])
     batch_size = int(args.batch_size if args.batch_size is not None else t["batch_size"])
     seed = int(args.seed if args.seed is not None else t["seed"])
+    # Seeding, in full. `torch.manual_seed` alone does NOT cover the CUDA RNG or
+    # cuDNN's algorithm choice, so two runs with the same seed can differ on GPU.
+    # 시드 전체. `torch.manual_seed` 만으로는 CUDA RNG 도 cuDNN 알고리즘 선택도
+    # 덮이지 않는다. 그래서 GPU 에서는 같은 시드로 두 번 돌려도 달라질 수 있다.
+    #
+    # ⚠️ 2026-09-16 실측 🟢 — 같은 데이터·같은 시드(0·1·2)·같은 평가 시드로 돌린
+    # 두 캠페인의 시드별 성공률이 76/52/63 과 30/63/77 이었다. 합산은 구간이
+    # 겹쳐 결론이 바뀌지 않았지만, **시드 0 이 76 에서 30 으로 갔다.**
+    # 그때까지 "시드를 고정했으니 재현된다" 고 믿고 있었다.
     torch.manual_seed(seed)
     np.random.seed(seed)
+    random.seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if args.deterministic:
+        # 느려진다. 그래서 기본값이 아니다 — 재현이 필요한 실행에만 켠다.
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        print("· 결정론 모드: cudnn.deterministic=True, benchmark=False (느리다)")
     device = torch.device(args.device)
 
     if args.random is not None:
@@ -640,6 +663,9 @@ def main() -> int:
                 "split_by": split_by, "val_fraction": val_fraction,
                 "val_episodes": val_episodes,
                 "lr": t["lr"], "loss": t["loss"], "seed": seed, "device": str(device),
+                # ⚠️ 이게 없으면 결정론 실행과 일반 실행이 같은 조건으로 조회된다.
+                # 시드가 같아도 재현성이 다른 두 실행을 구별할 수 없게 된다.
+                "deterministic": bool(args.deterministic),
                 # ⚠️ 2026-09-15 추가 — 체크포인트 경로. 이게 없어서 `eval/repeat.py` 가
                 # (trained_on, seed) 만으로 학습 기록을 찾았고, **같은 데이터·같은 시드로
                 # 8잡을 병렬로 돌리자 서로의 val_loss 를 집어갔다.** 조건마다 val 이
