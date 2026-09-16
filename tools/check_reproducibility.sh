@@ -25,14 +25,28 @@ export CUDA_VISIBLE_DEVICES=2
 DATA=datasets/mix_cmd
 mkdir -p out/logs checkpoints/bc
 
+# ⚠️ 2026-09-16 정정 — 첫 판은 `grep -o 'val [0-9.]*'` 였다. `*` 가 "0개 이상"
+# 이라 학습 시작 전 안내문("val 은 학습에 없는 물체 위치다")의 `val ` 이 숫자 없이
+# 매칭됐고, 빈 값끼리 비교해 **"같다"** 가 출력됐다. 빈 결과와 정상 결과가 같은
+# 모양으로 나온 것이다 — `TS_instrument_empty_field_0915.md` 의 그 병이다.
+# 이제 epoch 줄만 잡고, 숫자를 1개 이상 요구하고, 비면 죽는다.
 run () {          # $1=태그  $2=추가인자
+  local log="out/logs/repro_$1.log"
   $PY tools/train_bc.py --data "$DATA" --seed 0 --epochs 5 --device cuda \
       --action-space joint_delta_gripper_binary --cameras cam_wrist \
       --target-sidecar command --chunk 8 \
       --out "checkpoints/bc/_repro_$1.pt" $2 \
-      > "out/logs/repro_$1.log" 2>&1
-  # 마지막 epoch 줄의 val 값
-  grep -o 'val [0-9.]*' "out/logs/repro_$1.log" | tail -1
+      > "$log" 2>&1
+  local rc=$?
+  local v
+  v=$(grep -E '^[[:space:]]*epoch[[:space:]]' "$log" | tail -1 \
+      | grep -oE 'val [0-9]+\.[0-9]+' | sed 's/val //')
+  if [ -z "$v" ]; then
+    echo "!! val 을 못 읽었다 (종료코드 $rc). 로그: $log" >&2
+    tail -5 "$log" >&2
+    exit 1
+  fi
+  echo "$v"
 }
 
 echo "=============================================="
