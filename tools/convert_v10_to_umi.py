@@ -214,6 +214,10 @@ def main() -> None:
     ap.add_argument("--anchor-seed", type=int, default=0)
     ap.add_argument("--split-seed", type=int, default=42)
     ap.add_argument("--holdout", type=int, default=14)
+    ap.add_argument("--only", choices=["all", "train", "holdout"], default="all",
+                    help="분할 중 어느 쪽만 zarr 로 낼지. "
+                         "**학습에는 train, 평가에는 holdout 을 쓴다.** "
+                         "all 로 학습하면 홀드아웃이 학습에 섞인다")
     ap.add_argument("--consistency-mm", type=float, default=1.0,
                     help="복원 교차검증 허용 오차[mm]. 넘으면 그 편을 버린다")
     a = ap.parse_args()
@@ -244,11 +248,26 @@ def main() -> None:
     env.close()
     print(f"시뮬 파지 pose (seed {a.anchor_seed}) {np.round(T_grasp[:3,3],4)}\n")
 
+    # 분할을 **먼저** 정한다. 어느 편을 내보내든 분할은 같아야 하기 때문이다.
+    # (변환 후에 나누면 --only 마다 분할이 달라질 수 있다)
+    all_eps = list(meta["episodes"])
+    rng0 = np.random.default_rng(a.split_seed)
+    shuffled = list(all_eps)
+    rng0.shuffle(shuffled)
+    hold_set = set(shuffled[:a.holdout])
+    if a.only == "train":
+        want = [e for e in all_eps if e not in hold_set]
+    elif a.only == "holdout":
+        want = [e for e in all_eps if e in hold_set]
+    else:
+        want = all_eps
+    print(f"분할 시드 {a.split_seed} · 홀드아웃 {a.holdout}편 · 이번 출력 = {a.only} ({len(want)}편)")
+
     rgb, pos, rot, grip, ends = [], [], [], [], []
     kept, dropped, gaps = [], [], []
     total = 0
 
-    for name in meta["episodes"]:
+    for name in want:
         f = d / f"{name}.npz"
         if not f.exists():
             dropped.append({"episode": name, "reason": "npz 없음"}); continue
@@ -293,12 +312,8 @@ def main() -> None:
         raise SystemExit(f"!! 물체 폭이 {spread:.1f}mm 흩어진다. 닫힘 검출이 틀렸을 수 있다. "
                          f"변환하지 않는다")
 
-    # 고정 분할 — 학습 시드가 바뀌어도 이 분할은 안 바뀐다
-    rng = np.random.default_rng(a.split_seed)
-    order = list(kept)
-    rng.shuffle(order)
-    hold = sorted(order[:a.holdout])
-    train = sorted(order[a.holdout:])
+    hold = sorted(e for e in all_eps if e in hold_set)
+    train = sorted(e for e in all_eps if e not in hold_set)
 
     out = Path(a.out).expanduser()
     store = zarr.ZipStore(str(out) + ".zarr.zip", mode="w")
@@ -327,7 +342,10 @@ def main() -> None:
         "episodes_kept": len(kept), "frames": total,
         "dropped": dropped,
         "closure_gap_mm": {"median": gs[len(gs) // 2], "min": gs[0], "max": gs[-1]},
-        "split": {"seed": a.split_seed, "train": len(train), "holdout": len(hold)},
+        "only": a.only,
+        "split": {"seed": a.split_seed, "train": len(train), "holdout": len(hold),
+                  "note": "분할은 원본 70편 전체에 대해 정해진다. --only 는 그중 어느 쪽을 "
+                          "내보낼지만 고른다. 학습=train, 평가=holdout"},
         "limitations": [
             "물체 배치 시드 1개만 사용",
             "접근 경로 미측정 ([ROS] MoveIt 범위)",
@@ -344,6 +362,9 @@ def main() -> None:
     if dropped:
         print("  버린 이유:", {x["reason"] for x in dropped})
     print(f"분할 고정 (시드 {a.split_seed}) — 학습 {len(train)}편 / 홀드아웃 {len(hold)}편")
+    if a.only == "all":
+        print("!! --only all 이다. 이 zarr 로 학습하면 홀드아웃이 학습에 섞인다. "
+              "학습용은 --only train 으로 다시 뽑아라")
     print(f"→ {out}.zarr.zip")
     print(f"→ {out}.provenance.json · {out}.split.json")
     print("⚠️ simulation-only grasp alignment. 실물 캘리브레이션이 아니다.")
