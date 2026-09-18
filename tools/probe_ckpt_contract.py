@@ -38,7 +38,11 @@ from typing import Any
 
 # 찾고 싶은 키. 경로를 가정하지 않고 재귀 탐색한다 — 설정 구조가 바뀌어도 안 깨진다.
 WANTED = ("horizon", "n_action_steps", "n_obs_steps", "obs_down_sample_steps",
-          "lr", "learning_rate", "num_inference_steps", "shape_meta")
+          "lr", "learning_rate", "num_inference_steps", "shape_meta",
+          # 2026-09-18 추가 — 계약의 layout/rotation/compose 를 정하는 값들.
+          # 초판에 빠져 있어서 v10 입력 규약을 모델 출력 규약으로 오인할 뻔했다.
+          "pose_repr", "obs_pose_repr", "action_pose_repr",
+          "rotation_rep", "rotation_transformer")
 
 
 # ── 순수 계산 — 자체검증 대상 ─────────────────────────────────────────────
@@ -112,11 +116,15 @@ def selftest() -> int:
 
     cfg = {"policy": {"horizon": 16, "n_action_steps": 8,
                       "noise_scheduler": {"num_inference_steps": 16}},
-           "optimizer": {"lr": 3e-4}, "task": {"obs_down_sample_steps": 3}}
+           "optimizer": {"lr": 3e-4},
+           "task": {"obs_down_sample_steps": 3,
+                    "pose_repr": {"obs_pose_repr": "relative",
+                                  "action_pose_repr": "relative"}}}
     f = find_keys(cfg, WANTED)
     ok = (f.get("policy.horizon") == 16 and f.get("optimizer.lr") == 3e-4
           and f.get("task.obs_down_sample_steps") == 3
-          and f.get("policy.noise_scheduler.num_inference_steps") == 16)
+          and f.get("policy.noise_scheduler.num_inference_steps") == 16
+          and f.get("task.pose_repr.action_pose_repr") == "relative")
     print(f"[4] 중첩 키 전체경로 수집 → {len(f)}개  ", end="")
     print("OK" if ok else f"!! 실패 — {f}"); bad += (not ok)
 
