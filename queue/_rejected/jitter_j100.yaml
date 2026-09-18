@@ -1,0 +1,13 @@
+name: jitter_j100
+prereg: docs/PREREG_jitter_campaign_0914.md
+kind: repeat_runs
+data: datasets/sim_pick_j100
+cameras: cam_wrist
+runs: 3
+epochs: 30
+episodes: 100
+seed_base: 0
+eval_seed_base: 3000
+action_space: joint_delta_gripper_binary
+device: cuda
+policy_device: cpu

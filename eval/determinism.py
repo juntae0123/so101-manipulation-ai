@@ -87,11 +87,11 @@ def probe_render(cfg: dict[str, Any], seed: int) -> dict[str, Any]:
 def probe_policy(cfg: dict[str, Any], ckpt: Path, seed: int, device: str) -> dict[str, Any]:
     """Feed one fixed observation to the policy twice.
     고정된 관측 하나를 정책에 두 번 넣는다."""
-    from policy.bc import BCPolicy
+    from policy.act import load_policy
 
     with MujocoPickEnv(cfg, render=True, object_jitter_m=0.05) as env:
         obs = env.reset(seed=seed)
-    policy = BCPolicy(ckpt, device=device)
+    policy = load_policy(ckpt, device=device)
     a1 = policy.act(obs)
     a2 = policy.act(obs)
     return {
@@ -106,11 +106,11 @@ def probe_rollout(cfg: dict[str, Any], ckpt: Path, seed: int, device: str) -> di
     """Run the same seed twice through the full rollout.
     같은 시드로 전체 롤아웃을 두 번 돌린다."""
     from eval.rollout import rollout
-    from policy.bc import BCPolicy
+    from policy.act import load_policy
 
     out = []
     with MujocoPickEnv(cfg, render=True, object_jitter_m=0.05) as env:
-        policy = BCPolicy(ckpt, device=device)
+        policy = load_policy(ckpt, device=device)
         for _ in range(2):
             r = rollout(env, policy, seed)
             out.append({

@@ -18,6 +18,7 @@ from contract.episode import (
 )
 from policy.baselines import ScriptedFeedbackPolicy
 from policy.bc import BCPolicy
+from policy.act import load_policy
 from sim.mujoco.env import MujocoPickEnv
 from sim.mujoco.build_scene import DEFAULT_CONFIG
 from tracking.exp_log import _git_rev, file_digest, log_run
@@ -52,7 +53,7 @@ def main() -> int:
     args.out.mkdir(parents=True)
 
     ckpts = list(args.policy_ckpt)
-    policies = [BCPolicy(path, device="cpu") for path in ckpts]
+    policies = [load_policy(path, device="cpu") for path in ckpts]
 
     queries = 0
     valid_queries = 0

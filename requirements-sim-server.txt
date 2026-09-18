@@ -1,0 +1,103 @@
+# requirements_sim_server.txt — UMI 시뮬 학습 환경 (GPU 서버 V100 용)
+# 2026-09-16 · 작성 김준태(트랙 B) · 원본 handoff/dependencies/requirements-runtime.txt
+#
+# 설치:
+#   conda create -n handoff312 python=3.12.14 -y
+#   conda activate handoff312
+#   pip install torch==2.13.0+cu126 torchvision==0.28.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+#   pip install -r requirements_sim_server.txt
+#
+# 실행 시 필수 환경변수 (헤드리스 렌더):  MUJOCO_GL=egl
+#
+# ── 확신도 ──────────────────────────────────────────────
+# 🟢 torch/torchvision 줄만 서버에서 실측 확인 (2026-09-16)
+#      2.13.0+cu126 → get_arch_list() 에 sm_70 포함, 실연산 통과
+#      ⚠️ 2.11.0+cu128 은 sm_75 이상 빌드라 V100 에서
+#         "CUDA error: no kernel image is available" 로 죽는다. 쓰지 마라
+# 🟡 나머지 줄은 handoff 패키지 원본 그대로. 이 조합 전체의
+#      서버 학습 스모크는 아직 통과 못 했다 (미검증)
+# ⚠️ numpy: 아래는 원본 핀 2.2.6 이다. torch 강제 재설치가 2.5.2 로
+#      올려버린 상태라 opencv/numba/zarr 와의 충돌 여부가 미확인이다.
+#      스모크 통과한 값으로 확정되면 이 줄을 갱신한다
+# ────────────────────────────────────────────────────────
+
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.13.0+cu126
+torchvision==0.28.0+cu126
+
+absl-py==2.5.0
+accelerate==0.30.1
+annotated-types==0.8.0
+antlr4-python3-runtime==4.9.3
+asciitree==0.3.3
+av==18.1.0
+certifi==2026.7.22
+charset-normalizer==3.5.1
+click==8.5.0
+colorama==0.4.6
+Deprecated==1.3.1
+diffusers==0.27.2
+dill==0.4.1
+docker-pycreds==0.4.0
+einops==0.8.2
+etils==1.14.0
+fasteners==0.20
+filelock==3.32.3
+fsspec==2026.7.0
+gitdb==4.0.12
+GitPython==3.1.62
+glfw==2.10.2
+huggingface-hub==0.25.2
+hydra-core==1.3.7
+idna==3.19
+imagecodecs==2026.8.16
+importlib_metadata==9.0.1
+iniconfig==2.3.0
+Jinja2==3.1.6
+llvmlite==0.49.0
+MarkupSafe==3.0.3
+mpmath==1.3.0
+mujoco==3.13.0
+networkx==3.6.1
+numba==0.67.0
+numcodecs==0.15.1
+numpy==2.2.6
+omegaconf==2.3.1
+opencv-python==5.0.0.93
+packaging==26.3
+pandas==3.0.5
+pillow==12.3.0
+platformdirs==4.11.8
+pluggy==1.6.0
+protobuf==5.29.6
+psutil==7.2.2
+pydantic==2.13.5
+pydantic_core==2.46.5
+Pygments==2.21.0
+PyOpenGL==3.1.10
+pytest==9.1.1
+python-dateutil==2.9.0.post0
+PyYAML==6.0.3
+regex==2026.9.10
+requests==2.34.2
+safetensors==0.8.0
+scipy==1.18.1
+sentry-sdk==2.69.1
+setproctitle==1.3.7
+setuptools==78.1.0
+six==1.17.0
+smmap==5.0.3
+sympy==1.14.0
+threadpoolctl==3.6.0
+timm==0.9.16
+tqdm==4.70.1
+trimesh==5.1.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+tzdata==2026.4
+urllib3==2.7.0
+wandb==0.17.9
+wrapt==2.4.1
+xxhash==4.0.1
+zarr==2.18.7
+zipp==4.1.0

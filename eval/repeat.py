@@ -142,6 +142,12 @@ def run_conditions(args: Any, train_seeds: list[int] | None = None) -> dict[str,
         # 행동공간 덮어쓰기. train_config_sha 는 파일 해시라 이걸 반영하지 못한다.
         "action_space_override": getattr(args, "action_space", None),
         "cameras_override": getattr(args, "cameras", None),
+        # 학습 타깃 사이드카. 이게 표류 검사 밖에 있으면 **타깃이 다른 두 실행이
+        # "동일 조건"으로 보고된다** — 오늘 가른 바로 그 축이다.
+        "target_sidecar": getattr(args, "target_sidecar", None),
+        # 청크 길이. 표류 검사 밖에 있으면 K 가 다른 두 실행이 "동일 조건" 으로
+        # 보고된다 — target_sidecar 와 같은 이유다.
+        "chunk": getattr(args, "chunk", 1),
         "train_config_sha": file_digest(DEFAULT_TRAIN_CONFIG),
         "gate": {"rollout": ROLLOUT_GATE, "min_runs": GATE_MIN_RUNS},
     }
@@ -166,6 +172,8 @@ def repeat(
     policy_device: str = "cpu",
     action_space: str | None = None,
     cameras: str | None = None,
+    target_sidecar: str | None = None,
+    chunk: int = 1,
 ) -> list[RunResult]:
     """Train `runs` times, score each, and collect the results.
     `runs` 회 학습하고 각각 채점해 결과를 모은다."""
@@ -192,6 +200,14 @@ def repeat(
         # L76 참조. 평가 환경은 여전히 2대를 렌더하고 정책이 필요한 것만 읽는다.
         if cameras is not None:
             train_cmd += ["--cameras", cameras]
+        # 사이드카 타깃. 계약 npz 는 그대로 두고 학습 타깃만 바꾼다 (S15P21A103-170).
+        # 평가는 타깃과 무관하다 — 정책이 낸 행동을 씬이 그대로 받는다.
+        if target_sidecar is not None:
+            train_cmd += ["--target-sidecar", target_sidecar]
+        # 행동 청크 길이. 평가 쪽은 인자를 받지 않는다 — 체크포인트 메타의 chunk 가
+        # 정책 클래스를 고른다(policy/act.py load_policy). 학습과 평가가 갈릴 수 없다.
+        if int(chunk) != 1:
+            train_cmd += ["--chunk", str(int(chunk))]
         _run(train_cmd)
         # `--policy-device` 를 자식에게 넘긴다. 안 넘기면 repeat_runs 의 conditions 에는
         # 기록되는데 실제 평가는 eval_rollout 기본값으로 돌아 **기록과 실행이 갈린다.**
@@ -202,7 +218,10 @@ def repeat(
               "--policy-ckpt", str(ckpt), "--log"])
 
         roll = _latest_record("rollout_baselines", {"policy_ckpt": str(ckpt)})
-        train = _latest_record("train_bc", {"trained_on": str(data), "seed": seed})
+        # ⚠️ 2026-09-15 정정 — (trained_on, seed) 로 찾으면 **병렬 실행에서 남의 기록을
+        # 집어간다.** 체크포인트 경로는 tag 를 포함해 조건마다 유일하다. 롤아웃 기록은
+        # 원래 policy_ckpt 로 찾고 있었고, 그래서 성공률은 오염되지 않았다.
+        train = _latest_record("train_bc", {"out": str(ckpt)})
         if roll is None:
             raise SystemExit(
                 f"EXP_LOG 에서 {ckpt.name} 의 롤아웃 기록을 찾지 못했다. "
@@ -298,6 +317,16 @@ def main() -> int:
         "--cameras", type=str, default=None,
         help="쉼표로 구분한 카메라 부분집합 (자식 train_bc 로 전달). 예: cam_wrist",
     )
+    parser.add_argument(
+        "--target-sidecar", type=str, default=None, metavar="NAME",
+        help="학습 타깃을 ep_XXXXX.NAME.npy 에서 읽는다 (예: command, lead8). "
+             "계약 npz 는 건드리지 않는다. train_bc 로 전달",
+    )
+    parser.add_argument(
+        "--chunk", type=int, default=1, metavar="K",
+        help="행동 청크 길이. train_bc 로 전달된다. 1 이면 기존 BC 와 비트 동일 "
+             "(policy/act.py G0). 평가는 체크포인트 메타에서 K 를 읽는다",
+    )
     parser.add_argument("--log", action="store_true")
     args = parser.parse_args()
 
@@ -339,6 +368,8 @@ def main() -> int:
         policy_device=args.policy_device,
         action_space=args.action_space,
         cameras=args.cameras,
+        target_sidecar=args.target_sidecar,
+        chunk=args.chunk,
     )
     summary = summarise(results)
 

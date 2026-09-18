@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from vlm.fp16_safety import _load_model  # noqa: E402  서버 실행으로 검증된 로더를 재사용한다
 from vlm.skill_choice import (  # noqa: E402
     CHANCE,
+    null_scores,
     SKILLS,
     ConditionReport,
     build_items,
@@ -127,14 +128,20 @@ def _free_generate(model: Any, processor: Any, image: Any, instruction: str,
 def run_condition(model: Any, processor: Any, model_id: str, condition: str,
                   items: list, images: list[Any], device: str,
                   do_freegen: bool, max_new_tokens: int,
-                  variant: str = "v1") -> ConditionReport:
+                  variant: str = "v1", calibrate: bool = False) -> ConditionReport:
+    prior: list[float] | None = None
+    if calibrate:
+        # 조건마다 한 번만 잰다. 이미지 조건이 후보 사전확률에 미치는 영향까지 포함된다.
+        prior = null_scores(model, processor, images[0], device, variant)
+        print(f"    {condition}: 사전확률 보정 "
+              + " ".join(f"{v:+.3f}" for v in prior), flush=True)
     picks: list[int] = []
     margins: list[float] = []
     frees: list[str] | None = [] if do_freegen else None
     t0 = time.time()
     for k, (it, img) in enumerate(zip(items, images)):
         pick, margin, _ = forced_choice_scores(model, processor, img, it.instruction,
-                                              device, variant)
+                                              device, variant, prior)
         picks.append(pick)
         margins.append(margin)
         if frees is not None:
@@ -212,6 +219,9 @@ def main() -> int:
     p.add_argument("--prompt-variant", choices=("v1", "v2"), default="v1",
                    help="enum 설명 판. v2 는 서로를 배제하는 특징을 넣은 것 "
                         "(PREREG_vlm_m0_prompt_v2_0912.md). **v1 측정을 대체하지 않는다**")
+    p.add_argument("--calibrate", action="store_true",
+                   help="후보별 무조건부 점수를 빼고 고른다 (빈도 편향 교정). "
+                        "PREREG_vlm_m0_calibrate_0912.md")
     p.add_argument("--max-new-tokens", type=int, default=48)
     p.add_argument("--out", type=Path, default=None, help="결과 JSON 경로")
     p.add_argument("--log", action="store_true")
@@ -248,7 +258,7 @@ def main() -> int:
         for cname, imgs in conditions.items():
             r = run_condition(model, processor, model_id, cname, items, imgs,
                               args.device, not args.no_freegen, args.max_new_tokens,
-                              args.prompt_variant)
+                              args.prompt_variant, args.calibrate)
             lo, hi = wilson95(r.forced_correct, r.n)
             print(f"  {cname:8s} 강제선택 {r.forced_acc:.2f} [{lo:.2f},{hi:.2f}] · "
                   f"JSON {r.json_parsed}/100 · enum {r.enum_ok}/100", flush=True)
@@ -269,8 +279,9 @@ def main() -> int:
             {k: v for k, v in r.__dict__.items()} for r in reports
         ],
     }
+    tagc = "_cal" if args.calibrate else ""
     out = args.out or Path("out") / (
-        f"vlm_m0_{args.prompt_variant}_{time.strftime('%Y%m%d_%H%M%S')}.json")
+        f"vlm_m0_{args.prompt_variant}{tagc}_{time.strftime('%Y%m%d_%H%M%S')}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n결과: {out}")
@@ -286,6 +297,7 @@ def main() -> int:
                 "camera": args.camera,
                 "freegen": not args.no_freegen,
                 "prompt_variant": args.prompt_variant,
+                "calibrated": args.calibrate,
                 "prereg": "docs/PREREG_vlm_m0_0912.md",
             },
             result={

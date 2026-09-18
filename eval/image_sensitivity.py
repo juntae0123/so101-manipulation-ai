@@ -44,6 +44,7 @@ import numpy as np
 
 from contract.episode import read_episode
 from policy.bc import BCPolicy
+from policy.act import load_policy
 from sim.base import Observation
 from sim.mujoco.build_scene import DEFAULT_CONFIG, joint_specs, load_config
 from tracking.exp_log import file_digest, log_run
@@ -169,7 +170,7 @@ def measure(
     if len(files) < 2:
         raise SystemExit(f"에피소드가 2편 이상 필요하다: {dataset}")
 
-    policy = BCPolicy(ckpt, device=device)
+    policy = load_policy(ckpt, device=device)
     print(f"{policy.describe()}\n")
 
     eps = [read_episode(p) for p in files]

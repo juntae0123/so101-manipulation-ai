@@ -125,6 +125,17 @@ def validate(item: dict, path: Path) -> list[str]:
         if unknown:
             bad.append(f"카메라 이름이 'cam_' 으로 시작하지 않는다: {unknown}")
 
+    # 청크 길이 오타를 밤새 돌린 뒤에 알면 하룻밤이 날아간다.
+    ch = item.get("chunk")
+    if ch is not None:
+        try:
+            ch = int(ch)
+        except (TypeError, ValueError):
+            bad.append(f"chunk 가 정수가 아니다: {item['chunk']!r}")
+        else:
+            if ch < 1:
+                bad.append(f"chunk 는 1 이상이어야 한다: {ch}")
+
     return bad
 
 
@@ -151,6 +162,12 @@ def build_cmd(item: dict) -> list[str]:
         cmd += ["--cameras", str(item["cameras"])]
     if item.get("image_noise") is not None:
         cmd += ["--image-noise", str(item["image_noise"])]
+    # 학습 타깃 사이드카. 계약 npz 는 그대로 두고 타깃만 바꾼다 (S15P21A103-170).
+    if item.get("target_sidecar"):
+        cmd += ["--target-sidecar", str(item["target_sidecar"])]
+    # 행동 청크 길이. 1 이면 기존 BC 와 비트 동일 (S15P21A103-171).
+    if item.get("chunk") is not None and int(item["chunk"]) != 1:
+        cmd += ["--chunk", str(int(item["chunk"]))]
     return cmd
 
 
@@ -168,15 +185,29 @@ def note(line: str) -> None:
         fh.write(line + "\n")
 
 
-def run_item(path: Path, log_dir: Path) -> tuple[Path, int, str]:
+def run_item(path: Path, log_dir: Path, slot: int | None = None,
+             gpu: int | None = None) -> tuple[Path, int, str]:
     """Run one queue item to completion. Returns (path, returncode, log path).
-    큐 항목 하나를 끝까지 돌린다. (경로, 종료코드, 로그경로) 를 반환한다."""
+    큐 항목 하나를 끝까지 돌린다. (경로, 종료코드, 로그경로) 를 반환한다.
+
+    `slot` 은 이 항목이 쓸 GPU 를 정한다. 없으면 `runtime_limits.pick_gpu()` 가 고른다.
+
+    ⚠️ 동시에 여러 항목을 띄우면 `pick_gpu()` 로는 안 된다 — 부하를 **시작 시점에
+    한 번** 읽으므로, 같은 순간에 뜬 항목들은 아직 아무 장도 바쁘지 않아 전부 같은
+    장을 고른다. 그래서 큐가 슬롯을 명시로 나눈다."""
     item = yaml.safe_load(path.read_text(encoding="utf-8"))
     name = item["name"]
     log = log_dir / f"{name}.log"
     env = dict(os.environ)
     # 항목마다 다른 락 이름을 줘야 병렬 기동이 가능하다 (runtime_limits.claim).
     env["AI_CLAIM_NAME"] = f"queue_{name}"
+    # `--gpu` 로 한 장에 몰 수 있다. 잡당 808MiB 라 32GB 카드에 여러 개가 들어간다
+    # (2026-09-15 실측 🟢). 한 장에 모으면 나머지 할당분을 건드리지 않는다.
+    if gpu is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    elif slot is not None:
+        from runtime_limits import ALLOWED_GPUS
+        env["CUDA_VISIBLE_DEVICES"] = str(ALLOWED_GPUS[slot % len(ALLOWED_GPUS)])
     env.setdefault("AI_THREADS", "2")
     env.setdefault("MUJOCO_GL", "egl")
     env["PYTHONPATH"] = f"{AI_ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}".rstrip(os.pathsep)
@@ -195,6 +226,11 @@ def main() -> int:
     parser.add_argument("--parallel", type=int, default=1,
                         help="동시 실행 수. 학습은 GPU 지만 평가는 CPU+EGL 렌더라 "
                              "경합은 CPU 에서 난다. 2 로 먼저 재고 올린다")
+    parser.add_argument(
+        "--gpu", type=int, default=None, metavar="N",
+        help="모든 항목을 이 카드 하나에 올린다. 없으면 할당분에 라운드로빈. "
+             "잡당 808MiB 라 32GB 카드에 8잡까지 여유가 있다 (2026-09-15 실측)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="검증만 하고 끝낸다")
     parser.add_argument("--allow-dirty", action="store_true",
                         help="더러운 트리 거부를 푼다. 결과의 code_sha 가 "
@@ -266,12 +302,27 @@ def main() -> int:
         print(f"[{when}] {path.stem}: rc={rc} {meaning} → {dest.parent.name}/  ({log})")
 
     started = time.time()
+    from runtime_limits import ALLOWED_GPUS
+    if args.gpu is not None and args.gpu not in ALLOWED_GPUS:
+        print(f"✗ --gpu {args.gpu} 는 할당분 {list(ALLOWED_GPUS)} 밖이다. "
+              f"남의 작업을 밀어낸다.")
+        return 2
+    if args.gpu is not None:
+        mib = args.parallel * 808
+        print(f"· 전 항목을 GPU {args.gpu} 에 올린다 "
+              f"(동시 {args.parallel}잡 ≈ {mib}MiB / 32GB)")
     if args.parallel <= 1:
         for path in plans:
-            finish(*run_item(path, log_dir))
+            finish(*run_item(path, log_dir, gpu=args.gpu))
     else:
+        if args.gpu is None and args.parallel > len(ALLOWED_GPUS):
+            print(f"⚠️ --parallel {args.parallel} 이 할당분 {len(ALLOWED_GPUS)}장보다 많다. "
+                  f"같은 장에 두 항목이 올라간다")
         with ThreadPoolExecutor(max_workers=args.parallel) as pool:
-            for path, rc, log in pool.map(lambda p: run_item(p, log_dir), plans):
+            jobs = list(enumerate(plans))
+            for path, rc, log in pool.map(
+                lambda t: run_item(t[1], log_dir, t[0], args.gpu), jobs
+            ):
                 finish(path, rc, log)
 
     mins = (time.time() - started) / 60

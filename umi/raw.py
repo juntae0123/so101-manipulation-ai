@@ -95,7 +95,27 @@ RAW_VERSION = "umi_intermediate/0.2.0-provisional"
 0.2.0 (2026-09-08): `gripper_status` 추가(SPEC 의 D/M/T/X), 번들 출처 필드 추가."""
 
 BUNDLE_SCHEMA_SUPPORTED = ("umi_raw/0.1.0",)
-"""`track_a/convert/arcore.py` 가 읽을 수 있는 번들 스키마. 다른 값이면 거부한다."""
+"""canonical 번들 스키마. 다른 값이면 거부한다.
+
+**정정 (2026-09-12, 김준태).** 0912 오전에 여기 `arpose.episode/1` 을 추가했다.
+틀렸다. 되돌린다.
+
+당시 논리는 "이 목록은 합의된 이름이 아니라 우리 파서가 읽을 수 있는 것"이었다.
+그 논리대로면 앱이 스키마 이름을 낼 때마다 이 목록이 길어지고, 그 순간부터
+`raw.py` 를 통과했다는 사실이 "canonical raw 다" 를 더는 뜻하지 않는다.
+검사가 통과 조건을 스스로 넓히면 그건 검사가 아니다.
+
+황도경 제안(2026-09-12)이 맞다 — **경계 어댑터에서 정규화한다.**
+  앱 원본 `arpose.episode/1`
+    -> 경계 어댑터 (`umi/arcore_pilot.py`, 트랙 A `track_a/convert/arpose_delivery.py`)
+    -> canonical `umi_raw/0.1.0`
+    -> `raw.py` 는 canonical 만 받는다
+어댑터는 원본 스키마 이름을 `meta.notes["bundle_schema_origin"]` 에 남긴다.
+출처는 보존되고, 통과 조건은 하나로 고정된다.
+
+⚠️ **SPEC 과 앱의 이름 불일치 자체는 해소되지 않았다.** MW·트랙 A 와 정해야 한다:
+   앱이 SPEC 이름으로 바꿀 것인가, SPEC 이 앱 이름을 받을 것인가.
+   그 결정 전까지 어댑터가 그 간극을 흡수한다 — `raw.py` 가 아니라."""
 
 GRIPPER_STATUS_VALID = ("D", "M")
 """`gap_m` 이 있는 상태값. D=양쪽 직접검출 · M=중심선 대칭 추정 (SPEC, 약 97%).

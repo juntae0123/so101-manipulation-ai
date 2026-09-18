@@ -65,11 +65,11 @@ def build_policy(name: str, env: MujocoPickEnv, ckpt: Path | None) -> Policy:
     if name == "zero":
         return ZeroPolicy()
     if name == "bc":
-        from policy.bc import BCPolicy
+        from policy.act import load_policy
 
         if ckpt is None:
             raise SystemExit("--policy bc 는 --policy-ckpt 가 필요하다")
-        pol = BCPolicy(ckpt)
+        pol = load_policy(ckpt)
         print(f"학습 정책 로드: {pol.describe()}")
         if pol.meta.get("trained_on") == "random_tensors":
             raise SystemExit("랜덤 텐서로 학습된 체크포인트다. 기록할 의미가 없다.")

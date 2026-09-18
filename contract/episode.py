@@ -7,14 +7,13 @@ both tracks to agree and a D-AI record.
 트랙 A(데이터)와 트랙 B(정책)의 **유일한** 접점이다. 이게 바뀌면 이미 수집한
 에피소드가 전부 무효가 된다. 변경에는 양 트랙 합의와 D-AI 기록이 필요하다.
 
-Status: PROVISIONAL. Issue S15P21A103-27 is not closed. Track A has not
-confirmed the camera layout or the gripper normalisation rule.
-상태: **잠정**. S15P21A103-27 미확정. 카메라 구성과 그리퍼 정규화 규칙에 대해
-트랙 A 확인이 아직 없다.
+Contract 0.3 fixes the deployable UMI channel meanings: one logical camera
+(`cam_wrist`), five arm joints, and full gripper gap. Old hinge-gripper data may
+still be opened for diagnosis but must fail validation for new training.
 
 Why timestamps are separate fields, even though the simulator makes them equal:
-in sim, image and action come from the same step, so the offset is structurally
-zero and the fields look pointless. On real hardware they do not, and
+in sim, the image/state and the action issued at that training row use the same
+clock, so the offset is structurally zero. On real hardware they do not, and
 S15P21A103-30 has to measure that offset. Without the fields the measurement is
 impossible, and a policy trained on misaligned data looks fine in sim and fails
 only on the robot — the hardest failure to trace.
@@ -36,16 +35,17 @@ import numpy as np
 
 from contract.ids import SKILL_IDS
 
-# 0.2.0 (2026-09-02): EpisodeMeta.skill_id 추가, SKILL_IDS enum 강제.
-# 0.1.0 데이터는 이 버전에서 거부된다 — 당시 수집분은 시뮬 스크립트 98편뿐이고
-# 재수집에 20분이면 된다. 실시연 데이터가 0편인 지금이 바꿀 수 있는 마지막 구간에
-# 가깝다. 750편을 모은 뒤 바꾸면 그때는 전량 폐기다.
-CONTRACT_VERSION = "0.2.0-provisional"
+# 0.3.0 (2026-09-10): single cam_wrist, channel 6 = full gap, action[t] = state[t+1].
+# A hinge value can also sit in [-1, 1], so the version—not a range check—is the
+# guard against accidentally training on the old semantic contract.
+CONTRACT_VERSION = "0.3.0-provisional"
 
 IMAGE_SHAPE = (3, 224, 224)  # CHW uint8
 STATE_DIM = 6
 ACTION_DIM = 6
 STATE_RANGE = (-1.0, 1.0)
+CAMERA_NAMES = ("cam_wrist",)
+GRIPPER_GAP_RANGE_M = (0.0, 0.09)
 
 # How far outside STATE_RANGE a value may sit before the episode is rejected.
 # Exposed as a constant because other code has to reason about it: a degree-based
@@ -123,6 +123,11 @@ def validate(ep: Episode, *, strict_range: bool = True) -> list[str]:
 
     if set(ep.images) != set(ep.meta.cameras):
         problems.append(f"camera mismatch: arrays={sorted(ep.images)} meta={sorted(ep.meta.cameras)}")
+    if tuple(ep.meta.cameras) != CAMERA_NAMES:
+        problems.append(
+            f"cameras must be {list(CAMERA_NAMES)} for the single physical UMI/robot camera, "
+            f"got {ep.meta.cameras}"
+        )
 
     for name, arr in ep.images.items():
         if arr.dtype != np.uint8:
@@ -178,6 +183,10 @@ def validate(ep: Episode, *, strict_range: bool = True) -> list[str]:
         problems.append(
             f"contract_version {ep.meta.contract_version!r} != {CONTRACT_VERSION!r}"
         )
+
+    if ep.state.shape == (n, STATE_DIM) and ep.action.shape == (n, ACTION_DIM) and n > 1:
+        if not np.allclose(ep.action[:-1], ep.state[1:], atol=RANGE_TOLERANCE, rtol=0.0):
+            problems.append("action[t] must equal state[t+1]; repeated/current-state targets are invalid")
 
     return problems
 
@@ -268,7 +277,7 @@ def write_dataset_index(out_dir: Path, extra: dict[str, Any] | None = None) -> P
     episodes = sorted(p.stem for p in out_dir.glob("*.npz"))
     index = {
         "contract_version": CONTRACT_VERSION,
-        "status": "PROVISIONAL — S15P21A103-27 미확정, 트랙 A 확인 필요",
+        "status": "PROVISIONAL — real calibration and runtime limits remain unverified",
         "observation": {
             "image": {"shape": list(IMAGE_SHAPE), "dtype": "uint8", "layout": "CHW"},
             "state": {"shape": [STATE_DIM], "dtype": "float32", "range": list(STATE_RANGE)},
@@ -278,15 +287,20 @@ def write_dataset_index(out_dir: Path, extra: dict[str, Any] | None = None) -> P
             "shape": [ACTION_DIM],
             "dtype": "float32",
             "range": list(STATE_RANGE),
-            "meaning": "목표 관절각 5개 + 그리퍼, 정규화된 값",
+            "meaning": "state[t+1]: 팔 관절각 5개 + 전체 gripper gap, 정규화된 값",
         },
         "action_timestamp": {"shape": [], "dtype": "float64", "unit": "s"},
         "skill_ids_allowed": list(SKILL_IDS),
         "joint_order": [
             "shoulder_pan", "shoulder_lift", "elbow_flex",
-            "wrist_flex", "wrist_roll", "gripper",
+            "wrist_flex", "wrist_roll", "gripper_gap",
         ],
-        "normalization": "x_norm = 2*(x_rad - lo)/(hi - lo) - 1, lo/hi = configs/so101.yaml joint range",
+        "cameras": list(CAMERA_NAMES),
+        "normalization": {
+            "arm": "x_norm = 2*(x_rad-lo)/(hi-lo)-1; J1~J5 limits from config",
+            "gripper_gap": "gap_norm = 2*gap_m/0.09-1; 0m=-1, 0.045m=0, 0.09m=1",
+        },
+        "temporal_semantics": "action[t] = state[t+1]; final raw state has no training row",
         "episodes": episodes,
         "n_episodes": len(episodes),
     }

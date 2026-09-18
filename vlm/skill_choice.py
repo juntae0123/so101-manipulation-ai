@@ -410,6 +410,30 @@ def wilson95(k: int, n: int) -> tuple[float, float]:
     return ((c - h) / d, (c + h) / d)
 
 
+NULL_INSTRUCTION = "N/A"
+"""내용 없는 지시문. 이걸로 후보들의 **무조건부** 점수를 재서 빼면 빈도 편향이 지워진다."""
+
+
+@torch.no_grad()
+def null_scores(
+    model: Any, processor: Any, image: Any, device: str, variant: str = "v1"
+) -> list[float]:
+    """Content-free baseline score per candidate -- the model's prior, not its answer.
+    후보별 무조건부 점수. 모델의 답이 아니라 **사전확률**이다.
+
+    왜 필요한가 (2026-09-12) 🟢.
+
+    v1·v2 둘 다 `pick_place` 만 20/20 이고 나머지 넷의 오분류가 **전부 그쪽으로** 쏠렸다.
+    enum 설명을 서로 배제하게 고쳐 써도(v2) 변하지 않았다 — 설명 문구 문제가 아니라
+    후보 문자열 자체의 빈도 편향이다. 평균 로그확률(길이 정규화)로는 안 잡힌다.
+
+    교정: 지시문을 내용 없는 값으로 바꿔 같은 방식으로 점수를 재고, 본 점수에서 뺀다.
+    남는 것은 "이 지시문이 이 후보를 **얼마나 더** 그럴듯하게 만드는가" 다.
+    """
+    return forced_choice_scores(model, processor, image, NULL_INSTRUCTION,
+                                device, variant)[2]
+
+
 @torch.no_grad()
 def forced_choice_scores(
     model: Any,
@@ -418,6 +442,7 @@ def forced_choice_scores(
     instruction: str,
     device: str,
     variant: str = "v1",
+    prior: list[float] | None = None,
 ) -> tuple[int, float, list[float]]:
     """Score all five candidates and return (argmax, margin, per-candidate mean logprob).
 
@@ -452,8 +477,11 @@ def forced_choice_scores(
         tok_lp = lp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
         scores.append(float(tok_lp.mean()))
 
-    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
-    margin = scores[order[0]] - scores[order[1]]
+    # 사전확률을 주면 빼고 고른다. 반환하는 `scores` 는 **원 점수** 그대로다 —
+    # 교정은 선택에만 적용하고 원자료는 남긴다.
+    ranked = scores if prior is None else [a - b for a, b in zip(scores, prior)]
+    order = sorted(range(len(ranked)), key=lambda i: ranked[i], reverse=True)
+    margin = ranked[order[0]] - ranked[order[1]]
     return order[0], margin, scores
 
 

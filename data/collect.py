@@ -49,9 +49,16 @@ class EpisodeRecorder:
         self.model = model
         self.cfg = cfg
         self.renderer = renderer
-        self.cameras = [
+        from contract.episode import CAMERA_NAMES
+
+        _all = [
             mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_CAMERA, i) for i in range(model.ncam)
         ]
+        # 계약 0.3.0 은 cam_wrist 한 대다 (D-AI-46). 씬은 2대 그대로 두고 기록만 거른다 —
+        # configs/so101.yaml 은 양 트랙 공유 파일이라 건드리지 않는다.
+        self.cameras = [c for c in _all if c in CAMERA_NAMES]
+        if not self.cameras:
+            raise RuntimeError(f"계약 카메라가 씬에 없다: {CAMERA_NAMES} vs {_all}")
         self.images: dict[str, list[np.ndarray]] = {c: [] for c in self.cameras}
         self.state: list[np.ndarray] = []
         self.action: list[np.ndarray] = []
@@ -79,12 +86,18 @@ class EpisodeRecorder:
         기록한 버퍼를 계약 Episode 로 조립한다."""
         meta.n_steps = len(self.state)
         meta.cameras = list(self.cameras)
+        # 계약 0.3.0: action[t] = state[t+1]. 마지막 스텝은 자기 자신으로 채운다.
+        # ⚠️ 이 규약 아래서는 기록해 둔 data.ctrl 이 버려진다 — 계약에 그 필드가 없다.
+        state_arr = np.stack(self.state).astype(np.float32)
+        action_arr = np.vstack([state_arr[1:], state_arr[-1:]]).astype(np.float32)
+        # 내린 명령(ctrl)은 계약에 필드가 없어 버려진다. 가설 검증을 위해 밖으로 노출한다.
+        self.command = np.stack(self.action).astype(np.float32)
         return Episode(
             meta=meta,
             images={c: np.stack(v).astype(np.uint8) for c, v in self.images.items()},
-            state=np.stack(self.state).astype(np.float32),
+            state=state_arr,
             state_timestamp=np.asarray(self.state_ts, dtype=np.float64),
-            action=np.stack(self.action).astype(np.float32),
+            action=action_arr,
             action_timestamp=np.asarray(self.action_ts, dtype=np.float64),
         )
 
@@ -210,7 +223,7 @@ def collect_one(
             "caveat": "스크립트 시연이다. 사람 시연이 아니다. 궤적 다양성이 없다.",
         },
     )
-    return rec.build(meta)
+    return rec.build(meta), rec.command
 
 
 def main() -> None:
@@ -238,11 +251,15 @@ def main() -> None:
 
     written: list[Path] = []
     skipped = 0
+    # ⚠️ 2026-09-15 추가 — 이 카운터가 없었다. 계약 검증에 걸려 버려진 편이
+    # **어디에도 집계되지 않아** 요약이 "136 중 1개 건너뜀" 으로 보였고 실제로는
+    # 3편이 빠져 있었다. 버리는 경로가 둘인데 요약이 하나만 셌다.
+    invalid = 0
     n_success = 0
     with mujoco.Renderer(model, height=height, width=width) as renderer:
         for i in range(args.episodes):
             xy = base_xy + rng.uniform(-args.jitter, args.jitter, size=2)
-            ep = collect_one(
+            got = collect_one(
                 cfg,
                 model,
                 renderer,
@@ -251,15 +268,19 @@ def main() -> None:
                 args.author,
                 args.skill_id,
             )
-            if ep is None:
+            if got is None:
                 skipped += 1
                 print(f"[{i + 1:3d}/{args.episodes}] SKIP  도달 불가 xy=({xy[0]:+.3f},{xy[1]:+.3f})")
                 continue
+            ep, command = got
             problems = validate(ep)
             if problems:
+                invalid += 1
                 print(f"[{i + 1:3d}/{args.episodes}] INVALID: {problems}")
                 continue
             path = write_episode(ep, args.out)
+            # 사이드카: 내린 명령. 계약 npz 를 건드리지 않으므로 검증기와 무관하다.
+            np.save(path.with_suffix(".command.npy"), command)
             written.append(path)
             n_success += int(ep.meta.success)
             print(
@@ -277,7 +298,17 @@ def main() -> None:
             "scripted": True,
         },
     )
-    print(f"\n에피소드 {len(written)}개 저장 (도달불가로 건너뜀 {skipped}개)")
+    # Every attempt lands in exactly one bucket, and the sum is checked. A summary
+    # a human has to reconcile by hand is a summary that hides things.
+    # 시도는 전부 정확히 한 칸에 들어가고, 합을 검산한다. 사람이 눈으로 맞춰봐야
+    # 하는 요약은 숨기는 요약이다.
+    print(f"\n시도 {args.episodes} = 저장 {len(written)} + 도달불가 {skipped} "
+          f"+ 계약위반 {invalid}")
+    accounted = len(written) + skipped + invalid
+    if accounted != args.episodes:
+        print(f"!! 합이 안 맞는다: {accounted} != {args.episodes}. "
+              f"집계되지 않는 폐기 경로가 있다")
+        raise SystemExit(4)
     print(f"파지 성공 {n_success}/{len(written)}")
     print(f"인덱스: {index}")
 
