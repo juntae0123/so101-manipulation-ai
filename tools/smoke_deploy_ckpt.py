@@ -107,7 +107,14 @@ def _prepare_umi_path(umi_root: str | None) -> str:
     'Error locating target' 로 죽는데, 그건 체크포인트 문제가 아니라 환경 문제다.
     둘을 구분해서 찍는다."""
     import importlib
-    import os
+
+    # ⚠️ 스크립트를 경로로 실행하면 sys.path[0] 은 **스크립트 디렉터리**이고 cwd 가 아니다.
+    #    `cd ~/handoff && python ~/S15P21A103/AI/tools/smoke_deploy_ckpt.py` 로 돌리면
+    #    `umi_adapter` 도 `third_party` 도 안 보인다. cwd 를 먼저 올린다.
+    for extra in (Path.cwd(), Path.cwd().parent):
+        if str(extra) not in sys.path:
+            sys.path.insert(0, str(extra))
+    importlib.invalidate_caches()
 
     if importlib.util.find_spec("diffusion_policy") is not None:
         return "UMI 경로: 이미 import 가능"
@@ -134,9 +141,12 @@ def _prepare_umi_path(umi_root: str | None) -> str:
             if importlib.util.find_spec("diffusion_policy") is not None:
                 return f"UMI 경로: sys.path += {cand}"
     raise ImportError(
-        f"diffusion_policy 를 못 찾았다. 시도한 곳 {len(tried)}군데: "
-        f"{[str(t) for t in tried]}. --umi-root 로 UMI 저장소 경로를 주거나, "
-        "공식 UMI 를 설치한 환경에서 돌려라. **체크포인트 문제가 아니라 환경 문제다.**")
+        f"diffusion_policy 를 못 찾았다.\n"
+        f"    cwd        {Path.cwd()}\n"
+        f"    sys.path[0:3] {sys.path[:3]}\n"
+        f"    시도한 곳 {len(tried)}군데: {[str(t) for t in tried]}\n"
+        "    --umi-root 로 UMI 저장소 경로(diffusion_policy 의 부모)를 주거나 공식 UMI 가 "
+        "설치된 환경에서 돌려라. **체크포인트 문제가 아니라 환경 문제다.**")
 
 
 def stage1(ctx: dict) -> tuple[int, int]:
