@@ -195,6 +195,8 @@ def build_manifest(cfg, n_params: int, src: Path, out: Path,
 
 
 def export(src: Path, out: Path, note: str) -> int:
+    """Strip to ema_model + write the contract manifest, then read back to verify.
+    ema_model 만 남기고 계약 manifest 를 쓴 뒤, 되읽어 검산한다."""
     import torch
     payload = torch.load(src, map_location="cpu", weights_only=False)
     info = inspect(payload)
@@ -206,7 +208,6 @@ def export(src: Path, out: Path, note: str) -> int:
     sd = payload["state_dicts"]
     ema = sd["ema_model"]
     n_params = count_params(ema)
-    epoch = None
     try:
         import dill
         epoch = dill.loads(payload["pickles"]["epoch"])
@@ -217,67 +218,46 @@ def export(src: Path, out: Path, note: str) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(slim, out)
 
-    # 이름이 겹치는 cfg. obs.horizon=2 와 action.horizon=8 이 공존한다
-    cfg = {
-        "n_action_steps": 8,
-        "shape_meta": {
-            "obs": {"camera0_rgb": {"horizon": 2}, "robot0_eef_pos": {"horizon": 2},
-                    "robot0_gripper_width": {"horizon": 2}},
-            "action": {"horizon": 8},
-        },
-        "policy": {"num_inference_steps": 16,
-                   "obs_encoder": {"model_name": "resnet18",
-                                   "shape_meta": {"action": {"shape": [10],
-                                                             "rotation_rep": "rotation_6d"}}}},
-        "task": {"pose_repr": {"action_pose_repr": "relative", "obs_pose_repr": "relative"},
-                 "obs_down_sample_steps": 1, "img_obs_horizon": 2, "low_dim_obs_horizon": 2,
-                 "camera_obs_latency": 0.125},
+    man = build_manifest(payload["cfg"], n_params, src, out, note, epoch)
+    man["sha256_source"] = sha256(src)
+    man["sha256_export"] = sha256(out)
+    man["bytes_source"] = src.stat().st_size
+    man["bytes_export"] = out.stat().st_size
+    mpath = out.with_suffix(".manifest.json")
+    mpath.write_text(json.dumps(man, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"\nnParams(ema)  {n_params:,}")
+    print(f"원본          {man['bytes_source']:,} 바이트")
+    print(f"배포본        {man['bytes_export']:,} 바이트  "
+          f"({man['bytes_export'] / man['bytes_source'] * 100:.1f}%)")
+    print(f"버린 것       {info['will_drop']}")
+    print(f"\n-> {out}\n-> {mpath}")
+
+    # 되읽기 검산 — 저장했다고 담긴 게 아니다
+    back = torch.load(out, map_location="cpu", weights_only=False)
+    ok = (set(back["state_dicts"]) == {"ema_model"}
+          and count_params(back["state_dicts"]["ema_model"]) == n_params)
+    print(f"되읽기 검산   {'OK' if ok else '!! 불일치'}  "
+          f"(키 {set(back['state_dicts'])}, nParams {count_params(back['state_dicts']['ema_model']):,})")
+
+    # 계약 빈칸 검사 — 받는 쪽이 추측하게 되는 항목을 모수와 함께 찍는다
+    must = {
+        "actionSpec.dim": man["actionSpec"]["dim"],
+        "actionSpec.horizon": man["actionSpec"]["horizon"],
+        "actionSpec.n_action_steps": man["actionSpec"]["n_action_steps"],
+        "runtimeSpec.action_pose_repr": man["runtimeSpec"]["required_kwarg"]["action_pose_repr"],
+        "runtimeSpec.obs_history_steps": man["runtimeSpec"]["obs_history_steps"],
+        "runtimeSpec.obs_down_sample_steps": man["runtimeSpec"]["obs_down_sample_steps"],
+        "runtimeSpec.num_inference_steps": man["runtimeSpec"]["num_inference_steps"],
     }
-    man = build_manifest(cfg, 19_078_252, Path("/x/a.ckpt"), Path("/y/b.ckpt"), "t", 59)
-    a = man["actionSpec"]
-    r = man["runtimeSpec"]
-    check("이름 겹침: action horizon 8 을 집는다", a["horizon"] == 8, str(a["horizon"]))
-    check("이름 겹침: obs 이력은 2 로 따로 집는다", r["obs_history_steps"] == 2,
-          str(r["obs_history_steps"]))
-    check("obs 이력 모수 표기", "3개 obs 키" in r["obs_history_source"])
-    check("dim 은 shape_meta.action.shape", a["dim"] == [10])
-    check("n_action_steps 8 · execSlice 는 실행측 선택",
-          a["n_action_steps"] == 8 and "cfg 값이 아니다" in a["execSlice_note"])
-    check("pose_repr 명시 경로", r["required_kwarg"]["action_pose_repr"] == "relative")
-    check("obs_down_sample_steps 1", r["obs_down_sample_steps"] == 1)
-    check("num_inference_steps 16", r["num_inference_steps"] == 16)
-    check("manifest: rot6d 행 규약 명시", "행" in a["rotation"])
-    check("manifest: 곱 순서 명시", a["compose"] == "T_next = T_cur @ A_relative")
-    check("manifest: ver1 78.1mm 경고 포함", "78.118819mm" in man["robotSpec"]["WARNING"])
-    check("manifest: 롤아웃 아님 명시", "롤아웃 성공률이 아니다" in man["performance"]["metric"])
-    check("manifest: contractVersion 미정 표기", man["contractVersion"].startswith("UNSET"))
-
-    # 판별력 — obs horizon 이 갈리면 하나로 적지 않는다
-    bad = {k: v for k, v in cfg.items()}
-    bad["shape_meta"] = {"obs": {"a": {"horizon": 2}, "b": {"horizon": 3}},
-                         "action": {"horizon": 8}}
-    m2 = build_manifest(bad, 0, Path("/x"), Path("/y"), "", None)
-    check("obs horizon 불일치 -> None + 사유",
-          m2["runtimeSpec"]["obs_history_steps"] is None
-          and "갈린다" in m2["runtimeSpec"]["obs_history_source"])
-
-    # 없는 경로는 None (아무거나 안 집는다)
-    m3 = build_manifest({}, 0, Path("/x"), Path("/y"), "", None)
-    check("빈 cfg -> 전부 None", m3["actionSpec"]["horizon"] is None
-          and m3["runtimeSpec"]["obs_history_steps"] is None)
-
-    try:
-        import torch  # noqa: F401
-        torch_ok = True
-    except ImportError:
-        torch_ok = False
-
-    print(f"\n자체검증 {ok} / {total}")
-    if not torch_ok:
-        print("⚠️ torch 없음 — 저장·되읽기 경로는 **미실행**이다. 통과가 아니다.")
-        print("   실제 추출은 서버(~/envs/handoff312)에서 돌려 되읽기 검산까지 확인하라.")
-        return 2
-    return 0 if ok == total else 1
+    blank = [k for k, v in must.items() if v is None]
+    print(f"계약 필수항목  채움 {len(must) - len(blank)} / {len(must)}")
+    for k, v in must.items():
+        print(f"  {'OK ' if v is not None else '!! '} {k:<36} {v}")
+    if blank:
+        print(f"\n!! 빈칸 {len(blank)}개 — 받는 쪽이 추측하게 된다. 보내기 전에 채워라.")
+        return 1
+    return 0 if ok else 1
 
 
 def selftest() -> int:
