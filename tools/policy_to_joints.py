@@ -95,6 +95,8 @@ SOURCE_CONTRACTS = {
 #      잘못 철회했고 (2) 회전까지 대조해서 원래 경고가 맞았음을 확인했다. 덮지 않는다.
 TCP_REFERENCE_BODY = "wrist_roll_link"
 TCP_VER1_Z_M = -0.158118819
+WRIST_ROLL_MAX_RAD = 1.0471975512   # +60도. 실물 재확인 전 상한 (황도경 2026-09-19).
+                                    # 브래킷 실측은 +64.86도지만 마진을 두고 60으로 막는다.
 TCP_MATCH_TOL_M = 0.002
 
 
@@ -246,12 +248,27 @@ def probe_jaw_axis(env) -> dict:
     # 턱은 양방향이라 부호가 의미 없다. 0~90도로 접는다.
     c = abs(float(np.clip(axis_tcp[0], -1.0, 1.0)))     # TCP +X 와의 |cos|
     angle_deg = float(np.degrees(np.arccos(c)))
+
+    # 세 축을 전부 돌려준다 (황도경 요청 2026-09-19).
+    # jaw 축만 맞고 approach·up 이 틀어져 있으면 "맞다" 로 보이면서 실제로는 돌아간다.
+    # TCP 프레임 기준: x = 첫 열, y = 둘째 열, z = 셋째 열.
+    axes = {"tcp_x_in_world": [float(v) for v in R_tcp[:, 0]],
+            "tcp_y_in_world": [float(v) for v in R_tcp[:, 1]],
+            "tcp_z_in_world": [float(v) for v in R_tcp[:, 2]]}
+    # jaw 가 TCP 의 어느 축에 가장 가까운가 — 이름을 붙여준다.
+    nearest = int(np.argmax(np.abs(axis_tcp)))
     return {
         "joint": jnames[jid],
         "n_gripper_slide_joints": len(slides),
         "n_joints": len(jnames),
         "jaw_axis_in_tcp": [float(v) for v in axis_tcp],
+        "jaw_nearest_tcp_axis": "xyz"[nearest],
         "angle_from_tcp_x_deg": angle_deg,
+        "angle_from_tcp_y_deg": float(np.degrees(np.arccos(
+            abs(float(np.clip(axis_tcp[1], -1.0, 1.0)))))),
+        "angle_from_tcp_z_deg": float(np.degrees(np.arccos(
+            abs(float(np.clip(axis_tcp[2], -1.0, 1.0)))))),
+        "tcp_axes_in_world": axes,
         "tolerance_deg": JAW_MATCH_TOL_DEG,
     }
 
@@ -370,29 +387,74 @@ def make_env(PickEnv, task_path: str):
 
 # ---------------------------------------------------------------- IK
 
-def solve_waypoints(env, poses, seed_q, jaw_offset_deg: float, ik_tol: float):
-    """Continuous IK; the previous solution seeds the next. 연속 IK, 이전 해가 다음 시드."""
+def geodesic_deg(Ra: np.ndarray, Rb: np.ndarray) -> float:
+    """Angle between two rotations [deg]. 두 회전 사이의 각."""
+    c = (float(np.trace(np.asarray(Ra).T @ np.asarray(Rb))) - 1.0) / 2.0
+    return float(np.degrees(np.arccos(max(-1.0, min(1.0, c)))))
+
+
+WRIST_ROLL_SEEDS_RAD = (-0.6, -0.3, 0.0, 0.3, 0.6)
+"""Seeds to try for the redundant wrist roll. 여유 자유도인 손목 회전의 시드 후보.
+
+왜 여러 개인가 (황도경 요청 2026-09-19): 5축에서 손목 회전은 측면 파지의 접근축
+둘레 자유도에 해당해 해가 여러 개 나올 수 있다. IK 를 한 시드로만 부르면 그중
+**턱 방향이 가장 틀어진 해**가 걸릴 수 있고, 그건 위치 잔차로는 안 잡힌다."""
+
+
+def solve_waypoints(env, poses, seed_q, jaw_offset_deg: float, ik_tol: float,
+                    jaw_tol_deg: float = 10.0):
+    """Continuous IK; among wrist-roll candidates, keep the smallest jaw error.
+    연속 IK. 손목 회전 후보 중 **턱 방향 오차가 가장 작은 해**를 고른다.
+
+    위치 잔차만 보면 턱이 돌아간 해도 통과한다. 목표 자세와의 측지각을 같이 보고,
+    그 값을 리포트에 남긴다. 그리고 실물 재확인 전까지 손목 회전은 +60도에서 막는다."""
     import mujoco
     seed = np.asarray(seed_q, dtype=float).copy()
+    wr_idx = 4                                  # pan/lift/elbow/wrist_flex/wrist_roll
     out = []
     for i, T in enumerate(poses):
         pos = T[:3, 3]
         R = apply_jaw_offset(T[:3, :3], jaw_offset_deg)
-        why, q = None, None
-        try:
-            q = env.ik(pos, R, seed=seed, strict=False)
-        except Exception as exc:                       # noqa: BLE001 — 사유를 남긴다
-            why = f"ik_exception:{type(exc).__name__}"
-        e_pos = float("nan")
-        if q is not None:
+
+        best = None
+        tried = 0
+        for wr in (seed[wr_idx], *WRIST_ROLL_SEEDS_RAD):
+            s2 = seed.copy()
+            s2[wr_idx] = float(wr)
+            tried += 1
+            try:
+                q = env.ik(pos, R, seed=s2, strict=False)
+            except Exception:                    # noqa: BLE001 — 후보 하나가 죽어도 계속
+                continue
+            if q is None:
+                continue
+            if float(q[wr_idx]) > WRIST_ROLL_MAX_RAD:
+                continue                          # 실물 재확인 전 상한
             env.ik_data.qpos[env.qids] = q
             mujoco.mj_forward(env.model, env.ik_data)
             Tc = env.tcp(env.ik_data)
             e_pos = float(np.linalg.norm(Tc[:3, 3] - pos))
+            e_rot = geodesic_deg(R, Tc[:3, :3])
+            if best is None or e_rot < best["e_rot"]:
+                best = {"q": q, "e_pos": e_pos, "e_rot": e_rot}
+
+        why = None
+        if best is None:
+            why = f"no_ik_solution (후보 {tried}개 전부 실패 또는 wrist_roll 상한 초과)"
+            e_pos = e_rot = float("nan")
+            q = None
+        else:
+            q, e_pos, e_rot = best["q"], best["e_pos"], best["e_rot"]
             if e_pos > ik_tol:
                 why = f"position_residual {e_pos * 1000:.2f}mm > {ik_tol * 1000:.1f}mm"
+            elif e_rot > jaw_tol_deg:
+                why = f"jaw_axis_residual {e_rot:.2f}deg > {jaw_tol_deg:.1f}deg"
+
         out.append({"index": i, "q": None if q is None else [float(v) for v in q],
-                    "position_residual_m": e_pos, "reject_reason": why})
+                    "position_residual_m": e_pos,
+                    "rotation_residual_deg": e_rot,
+                    "wrist_roll_candidates_tried": tried,
+                    "reject_reason": why})
         if q is not None and why is None:
             seed = np.asarray(q, float)
     return out
@@ -583,6 +645,20 @@ def selftest() -> int:
           SOURCE_CONTRACTS["official_umi"] == (1, 5)
           and SOURCE_CONTRACTS["v10_direct"] == (0, 4))
 
+    # [21~24] 손목 회전 상한 · 측지각 (황도경 요청 2026-09-19)
+    check("wrist_roll 상한이 +60도 (실물 재확인 전)",
+          abs(np.degrees(WRIST_ROLL_MAX_RAD) - 60.0) < 1e-6,
+          f"{np.degrees(WRIST_ROLL_MAX_RAD):.4f}도")
+    check("측지각: 같은 회전이면 0도 (정답 아는 행)",
+          abs(geodesic_deg(np.eye(3), np.eye(3))) < 1e-9)
+    Rz90 = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    check("측지각: z 90도 회전이면 90도", abs(geodesic_deg(np.eye(3), Rz90) - 90.0) < 1e-9)
+    check("판별력: 92.79도 jaw 보정의 측지각이 92.79도",
+          abs(geodesic_deg(np.eye(3), apply_jaw_offset(np.eye(3), 92.789))
+              - 92.789) < 1e-6)
+    check("손목 시드 후보가 여러 개다 (한 시드면 턱 틀어진 해가 걸린다)",
+          len(WRIST_ROLL_SEEDS_RAD) >= 3)
+
     print(f"\n자체검증 {ok} / {total}")
     return 0 if ok == total else 1
 
@@ -621,6 +697,8 @@ def main() -> None:
     ap.add_argument("--tcp-offset-m", type=float, default=None,
                     help="파지점 게이트를 건너뛴다. 명시한 사람 책임")
     ap.add_argument("--ik-tol", type=float, default=0.008, help="위치 잔차 허용치 m")
+    ap.add_argument("--jaw-tol-deg", type=float, default=10.0,
+                    help="목표 자세와의 측지각 허용치 [도]. 위치만 보면 턱이 돌아간 해가 통과한다")
     ap.add_argument("--out", default=None, help="전체 리포트 JSON")
     ap.add_argument("--out-replay", default=None,
                     help="replay_trajectory.py --trajectory 가 먹는 [[q1..q5], ...]")
@@ -675,7 +753,7 @@ def main() -> None:
         ap.error("--from-home 또는 --from-q 중 하나가 필요하다")
 
     poses, gaps, diag = decode_chunk(action, T_cur, exec_slice=(lo, hi))
-    sol = solve_waypoints(env, poses, seed_q, jaw_deg, a.ik_tol)
+    sol = solve_waypoints(env, poses, seed_q, jaw_deg, a.ik_tol, a.jaw_tol_deg)
 
     good = [s for s in sol if s["q"] is not None and s["reject_reason"] is None]
     print(f"\nIK 성공 {len(good)} / 요청 {len(sol)}  (청크 horizon {diag['horizon']}, "
