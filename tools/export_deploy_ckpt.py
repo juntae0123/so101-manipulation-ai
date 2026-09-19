@@ -81,27 +81,44 @@ def count_params(state: dict) -> int:
     return n
 
 
+def at(node, path: str, default=None):
+    """Read one EXPLICIT dotted path. 점 경로 하나를 명시적으로 읽는다.
+
+    ⚠️ 2026-09-19: 초판은 키 이름을 재귀 탐색했다. cfg 안에 `horizon` 이 수십 번 나오고
+    (obs 는 2, action 은 8) **먼저 찾히는 것**을 집었다. 8 이 나온 건 운이다.
+    이름이 겹치는 설정에서 재귀 탐색은 판별력이 없다. 경로를 적는다."""
+    cur = node
+    for part in path.split("."):
+        if not hasattr(cur, "__getitem__"):
+            return default
+        try:
+            cur = cur[part]
+        except Exception:                              # noqa: BLE001
+            return default
+    return cur
+
+
+def obs_history(cfg) -> tuple[object, str]:
+    """Observation history length, with the denominator. 관측 이력 길이와 모수.
+
+    `n_obs_steps` 라는 키는 이 체크포인트에 **없다**. 항목마다
+    `shape_meta.obs.<key>.horizon` 으로 들어 있고 전부 같아야 한다."""
+    obs = at(cfg, "shape_meta.obs")
+    if obs is None or not hasattr(obs, "items"):
+        return None, "shape_meta.obs 없음"
+    vals = {k: at(v, "horizon") for k, v in obs.items()}
+    uniq = sorted({v for v in vals.values() if v is not None})
+    detail = f"{len(vals)}개 obs 키 중 값 있는 것 {len([v for v in vals.values() if v is not None])}, 서로 다른 값 {uniq}"
+    if len(uniq) == 1:
+        return uniq[0], detail
+    return None, detail + "  ← 값이 갈린다. 하나로 못 적는다"
+
+
 def build_manifest(cfg, n_params: int, src: Path, out: Path,
                    note: str, epoch) -> dict:
     """The contract the receiving side must not have to guess.
     받는 쪽이 추측하지 않아도 되도록 적는 계약."""
-
-    def dig(node, *names):
-        """Find the first of `names` anywhere in a nested mapping. 중첩에서 먼저 찾히는 값."""
-        stack = [node]
-        while stack:
-            cur = stack.pop()
-            if hasattr(cur, "items"):
-                for k, v in cur.items():
-                    if k in names:
-                        return v
-                    if hasattr(v, "items") or isinstance(v, (list, tuple)):
-                        stack.append(v)
-            elif isinstance(cur, (list, tuple)):
-                stack.extend(cur)
-        return None
-
-    pose_repr = dig(cfg, "action_pose_repr")
+    n_obs, n_obs_detail = obs_history(cfg)
     return {
         "contractVersion": "UNSET — Jetson 추론 코드와 합의 후 채운다",
         "source_checkpoint": str(src),
@@ -110,40 +127,59 @@ def build_manifest(cfg, n_params: int, src: Path, out: Path,
         "epoch": epoch,
         "nParams": n_params,
         "actionSpec": {
-            "dim": 10,
-            "horizon": dig(cfg, "horizon"),
+            "dim": at(cfg, "policy.obs_encoder.shape_meta.action.shape"),
+            "horizon": at(cfg, "shape_meta.action.horizon"),
+            "n_action_steps": at(cfg, "n_action_steps"),
             "rateHz": 10,
             "rateHz_note": "공칭이다. v10 원본 간격이 불균일하므로 0.1초 고정 가정 금지",
             "layout": {"0:3": "dx,dy,dz (m, 상대)",
                        "3:9": "rot6d",
                        "9": "gap (m, 절대)"},
             "rotation": "회전행렬의 첫 두 **행**. 열이 아니다",
+            "rotation_rep_cfg": at(cfg, "policy.obs_encoder.shape_meta.action.rotation_rep"),
             "compose": "T_next = T_cur @ A_relative",
             "anchor": "T_cur = 현재 TCP = 패드 사이 중심 (손끝 아님)",
             "gapUnit": "m",
             "gapRange": [0.0, 0.09],
             "execSlice": [1, 5],
+            "execSlice_note": ("cfg 값이 아니다. 모델은 8점을 내고(n_action_steps) "
+                               "evaluate.py 가 action_steps=4 로 index [1,5) 만 실행한 뒤 "
+                               "재관측한다. 실행측 선택이므로 바꾸려면 여기도 바꾼다"),
             "converted_form": "7차원 축각 절대 (pos3 + rotvec3 + gap)",
         },
         "runtimeSpec": {
             "decoder": "diffusion_policy.common.replay_buffer / real_inference_util.get_real_umi_action",
-            "required_kwarg": {"action_pose_repr": pose_repr or "relative"},
+            "required_kwarg": {
+                "action_pose_repr": at(cfg, "task.pose_repr.action_pose_repr")},
+            "obs_pose_repr": at(cfg, "task.pose_repr.obs_pose_repr"),
             "WARNING": ("기본값이 'abs' 다. 인자를 안 넘기면 상대를 절대로 해석한다. "
                         "'rel' 은 소스 주석이 legacy buggy implementation 이라 적은 별개 경로다. "
                         "'relative' 만 맞고 셋 다 에러 없이 돈다"),
-            "n_obs_steps": dig(cfg, "n_obs_steps"),
-            "obs_down_sample_steps": dig(cfg, "obs_down_sample_steps"),
-            "num_inference_steps": dig(cfg, "num_inference_steps"),
+            "obs_history_steps": n_obs,
+            "obs_history_source": ("shape_meta.obs.<key>.horizon — `n_obs_steps` 라는 키는 "
+                                   f"이 체크포인트에 없다. 집계: {n_obs_detail}"),
+            "obs_keys": sorted(at(cfg, "shape_meta.obs").keys())
+                        if hasattr(at(cfg, "shape_meta.obs"), "keys") else None,
+            "img_obs_horizon": at(cfg, "task.img_obs_horizon"),
+            "low_dim_obs_horizon": at(cfg, "task.low_dim_obs_horizon"),
+            "obs_down_sample_steps": at(cfg, "task.obs_down_sample_steps"),
+            "num_inference_steps": at(cfg, "policy.num_inference_steps"),
+            "vision_encoder": at(cfg, "policy.obs_encoder.model_name"),
+            "camera_obs_latency_s": at(cfg, "task.camera_obs_latency"),
             "frameworkVersion_train": "torch 2.13.0+cu126 (V100, sm_70)",
             "frameworkVersion_infer": "UNSET — Jetson 보드 확정 후",
         },
         "robotSpec": {
-            "pinch_offset_local_m": "ver1 [0, 0, -0.158118819]. 레거시 -0.080 과 78.1mm 차이",
-            "WARNING": ("실물은 ver1 이다. 레거시 값으로 IK 를 풀면 접근축으로 78.1mm "
-                        "상수 편향. 파지 여유는 ±25mm = (개구 90 − 물체 41)/2 뿐이고 "
-                        "hand-eye 계열 상수 편향은 학습이 지우지 못한다"),
-            "jaw_axis": ("ver1 jaw 는 레거시(+X) 기준 gripper 로컬 +Z 주위 +92.79도. "
-                         "현행 IK 는 jaw 를 구속하지 않으므로 wrist_roll 로 보정해야 한다"),
+            "pinch_offset_local_m": "ver1 [0, 0, -0.158118819] (wrist_roll_link 기준)",
+            "verified": ("handoff 시뮬 모델이 이미 ver1 기하다. policy_to_joints.py --probe-tcp "
+                         "실측 z = -0.15811881850916723, ver1 기대값과 4.9e-10 m 차이"),
+            "WARNING": ("AI 저장소 구 MJCF 경로(so101.yaml -0.080)로 IK 를 풀면 접근축으로 "
+                        "78.118819mm 상수 편향. 같은 프레임 확인됨(MJCF gripper body vs URDF "
+                        "wrist_roll_link 회전 상대각 0.0003도). 파지 여유는 ±25mm 뿐이고 "
+                        "이런 상수 편향은 학습이 지우지 못한다"),
+            "jaw_axis": ("ver1 jaw 는 레거시(+X) 기준 gripper 로컬 +Z 주위 +92.7889도. "
+                         "URDF 패드 기하에서 검산(문서값과 0.0011도 차이). 현행 IK 는 jaw 를 "
+                         "구속하지 않으므로 wrist_roll 로 보정해야 한다"),
             "handEye_T_camera_pinch": "AI/configs/real/umi_s22_canonical_pinch_side_grasp.json",
             "handEye_scope": "시연 리그 기준이다. 로봇팔 카메라 마운트 자세는 미상 (URDF 카메라 링크 0개)",
         },
@@ -181,28 +217,67 @@ def export(src: Path, out: Path, note: str) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(slim, out)
 
-    man = build_manifest(payload["cfg"], n_params, src, out, note, epoch)
-    man["sha256_source"] = sha256(src)
-    man["sha256_export"] = sha256(out)
-    man["bytes_source"] = src.stat().st_size
-    man["bytes_export"] = out.stat().st_size
-    mpath = out.with_suffix(".manifest.json")
-    mpath.write_text(json.dumps(man, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 이름이 겹치는 cfg. obs.horizon=2 와 action.horizon=8 이 공존한다
+    cfg = {
+        "n_action_steps": 8,
+        "shape_meta": {
+            "obs": {"camera0_rgb": {"horizon": 2}, "robot0_eef_pos": {"horizon": 2},
+                    "robot0_gripper_width": {"horizon": 2}},
+            "action": {"horizon": 8},
+        },
+        "policy": {"num_inference_steps": 16,
+                   "obs_encoder": {"model_name": "resnet18",
+                                   "shape_meta": {"action": {"shape": [10],
+                                                             "rotation_rep": "rotation_6d"}}}},
+        "task": {"pose_repr": {"action_pose_repr": "relative", "obs_pose_repr": "relative"},
+                 "obs_down_sample_steps": 1, "img_obs_horizon": 2, "low_dim_obs_horizon": 2,
+                 "camera_obs_latency": 0.125},
+    }
+    man = build_manifest(cfg, 19_078_252, Path("/x/a.ckpt"), Path("/y/b.ckpt"), "t", 59)
+    a = man["actionSpec"]
+    r = man["runtimeSpec"]
+    check("이름 겹침: action horizon 8 을 집는다", a["horizon"] == 8, str(a["horizon"]))
+    check("이름 겹침: obs 이력은 2 로 따로 집는다", r["obs_history_steps"] == 2,
+          str(r["obs_history_steps"]))
+    check("obs 이력 모수 표기", "3개 obs 키" in r["obs_history_source"])
+    check("dim 은 shape_meta.action.shape", a["dim"] == [10])
+    check("n_action_steps 8 · execSlice 는 실행측 선택",
+          a["n_action_steps"] == 8 and "cfg 값이 아니다" in a["execSlice_note"])
+    check("pose_repr 명시 경로", r["required_kwarg"]["action_pose_repr"] == "relative")
+    check("obs_down_sample_steps 1", r["obs_down_sample_steps"] == 1)
+    check("num_inference_steps 16", r["num_inference_steps"] == 16)
+    check("manifest: rot6d 행 규약 명시", "행" in a["rotation"])
+    check("manifest: 곱 순서 명시", a["compose"] == "T_next = T_cur @ A_relative")
+    check("manifest: ver1 78.1mm 경고 포함", "78.118819mm" in man["robotSpec"]["WARNING"])
+    check("manifest: 롤아웃 아님 명시", "롤아웃 성공률이 아니다" in man["performance"]["metric"])
+    check("manifest: contractVersion 미정 표기", man["contractVersion"].startswith("UNSET"))
 
-    print(f"\nnParams(ema)  {n_params:,}")
-    print(f"원본          {man['bytes_source']:,} 바이트")
-    print(f"배포본        {man['bytes_export']:,} 바이트  "
-          f"({man['bytes_export'] / man['bytes_source'] * 100:.1f}%)")
-    print(f"버린 것       {info['will_drop']}")
-    print(f"\n-> {out}\n-> {mpath}")
+    # 판별력 — obs horizon 이 갈리면 하나로 적지 않는다
+    bad = {k: v for k, v in cfg.items()}
+    bad["shape_meta"] = {"obs": {"a": {"horizon": 2}, "b": {"horizon": 3}},
+                         "action": {"horizon": 8}}
+    m2 = build_manifest(bad, 0, Path("/x"), Path("/y"), "", None)
+    check("obs horizon 불일치 -> None + 사유",
+          m2["runtimeSpec"]["obs_history_steps"] is None
+          and "갈린다" in m2["runtimeSpec"]["obs_history_source"])
 
-    # 되읽기 검산 — 저장했다고 담긴 게 아니다
-    back = torch.load(out, map_location="cpu", weights_only=False)
-    ok = (set(back["state_dicts"]) == {"ema_model"}
-          and count_params(back["state_dicts"]["ema_model"]) == n_params)
-    print(f"되읽기 검산   {'OK' if ok else '!! 불일치'}  "
-          f"(키 {set(back['state_dicts'])}, nParams {count_params(back['state_dicts']['ema_model']):,})")
-    return 0 if ok else 1
+    # 없는 경로는 None (아무거나 안 집는다)
+    m3 = build_manifest({}, 0, Path("/x"), Path("/y"), "", None)
+    check("빈 cfg -> 전부 None", m3["actionSpec"]["horizon"] is None
+          and m3["runtimeSpec"]["obs_history_steps"] is None)
+
+    try:
+        import torch  # noqa: F401
+        torch_ok = True
+    except ImportError:
+        torch_ok = False
+
+    print(f"\n자체검증 {ok} / {total}")
+    if not torch_ok:
+        print("⚠️ torch 없음 — 저장·되읽기 경로는 **미실행**이다. 통과가 아니다.")
+        print("   실제 추출은 서버(~/envs/handoff312)에서 돌려 되읽기 검산까지 확인하라.")
+        return 2
+    return 0 if ok == total else 1
 
 
 def selftest() -> int:
@@ -216,39 +291,59 @@ def selftest() -> int:
         ok += bool(cond)
         print(f"[{total}] {name:<44} {'OK' if cond else '!! 실패'}  {detail}")
 
-    good = {"cfg": {"horizon": 8}, "state_dicts": {"model": {}, "ema_model": {}, "optimizer": {}}}
+    good = {"cfg": {}, "state_dicts": {"model": {}, "ema_model": {}, "optimizer": {}}}
     i = inspect(good)
     check("정상 payload 인식", i["missing_top"] == [] and i["missing_state"] == [],
           f"top {i['top_found']} · state {i['state_found']}")
     check("버릴 키 식별", set(i["will_drop"]) == {"model", "optimizer"}, str(i["will_drop"]))
+    check("ema_model 없음 -> 누락", inspect({"cfg": {}, "state_dicts": {"model": {}}})["missing_state"] == ["ema_model"])
+    check("cfg 없음 -> 누락", inspect({"state_dicts": {"ema_model": {}}})["missing_top"] == ["cfg"])
+    e = inspect({})
+    check("빈 payload -> 전부 누락", len(e["missing_top"]) == 2 and e["top_found"] == "0 / 2", e["top_found"])
 
-    no_ema = {"cfg": {}, "state_dicts": {"model": {}}}
-    check("ema_model 없음 -> 누락으로 잡힘", inspect(no_ema)["missing_state"] == ["ema_model"])
+    # 이름이 겹치는 cfg. obs.horizon=2 와 action.horizon=8 이 공존한다
+    cfg = {
+        "n_action_steps": 8,
+        "shape_meta": {
+            "obs": {"camera0_rgb": {"horizon": 2}, "robot0_eef_pos": {"horizon": 2},
+                    "robot0_gripper_width": {"horizon": 2}},
+            "action": {"horizon": 8},
+        },
+        "policy": {"num_inference_steps": 16,
+                   "obs_encoder": {"model_name": "resnet18",
+                                   "shape_meta": {"action": {"shape": [10],
+                                                             "rotation_rep": "rotation_6d"}}}},
+        "task": {"pose_repr": {"action_pose_repr": "relative", "obs_pose_repr": "relative"},
+                 "obs_down_sample_steps": 1, "img_obs_horizon": 2, "low_dim_obs_horizon": 2,
+                 "camera_obs_latency": 0.125},
+    }
+    man = build_manifest(cfg, 19_078_252, Path("/x/a.ckpt"), Path("/y/b.ckpt"), "t", 59)
+    a, r = man["actionSpec"], man["runtimeSpec"]
+    check("이름 겹침: action horizon 8 을 집는다", a["horizon"] == 8, str(a["horizon"]))
+    check("이름 겹침: obs 이력은 2 로 따로", r["obs_history_steps"] == 2, str(r["obs_history_steps"]))
+    check("obs 이력 모수 표기", "3개 obs 키" in r["obs_history_source"])
+    check("dim 은 shape_meta.action.shape", a["dim"] == [10])
+    check("n_action_steps 8 · execSlice 실행측",
+          a["n_action_steps"] == 8 and "cfg 값이 아니다" in a["execSlice_note"])
+    check("pose_repr 명시 경로", r["required_kwarg"]["action_pose_repr"] == "relative")
+    check("obs_down_sample_steps 1", r["obs_down_sample_steps"] == 1)
+    check("num_inference_steps 16", r["num_inference_steps"] == 16)
+    check("rot6d 행 규약 명시", "행" in a["rotation"])
+    check("곱 순서 명시", a["compose"] == "T_next = T_cur @ A_relative")
+    check("ver1 78.1mm 경고", "78.118819mm" in man["robotSpec"]["WARNING"])
+    check("롤아웃 아님 명시", "롤아웃 성공률이 아니다" in man["performance"]["metric"])
+    check("contractVersion 미정 표기", man["contractVersion"].startswith("UNSET"))
 
-    no_cfg = {"state_dicts": {"ema_model": {}}}
-    check("cfg 없음 -> 누락으로 잡힘", inspect(no_cfg)["missing_top"] == ["cfg"])
+    bad = dict(cfg)
+    bad["shape_meta"] = {"obs": {"a": {"horizon": 2}, "b": {"horizon": 3}}, "action": {"horizon": 8}}
+    m2 = build_manifest(bad, 0, Path("/x"), Path("/y"), "", None)
+    check("obs horizon 불일치 -> None + 사유",
+          m2["runtimeSpec"]["obs_history_steps"] is None
+          and "갈린다" in m2["runtimeSpec"]["obs_history_source"])
 
-    empty = {}
-    e = inspect(empty)
-    check("빈 payload -> 전부 누락", len(e["missing_top"]) == 2 and e["top_found"] == "0 / 2",
-          e["top_found"])
-
-    man = build_manifest({"horizon": 8, "task": {"pose_repr": {"action_pose_repr": "relative"}},
-                          "policy": {"num_inference_steps": 16}},
-                         19_078_252, Path("/x/a.ckpt"), Path("/y/b.ckpt"), "t", 59)
-    check("manifest: horizon 재귀 탐색", man["actionSpec"]["horizon"] == 8)
-    check("manifest: pose_repr 재귀 탐색",
-          man["runtimeSpec"]["required_kwarg"]["action_pose_repr"] == "relative")
-    check("manifest: rot6d 행 규약 명시", "행" in man["actionSpec"]["rotation"])
-    check("manifest: 곱 순서 명시",
-          man["actionSpec"]["compose"] == "T_next = T_cur @ A_relative")
-    check("manifest: ver1 78.1mm 경고 포함", "78.1mm" in man["robotSpec"]["WARNING"])
-    check("manifest: 롤아웃 아님 명시", "롤아웃 성공률이 아니다" in man["performance"]["metric"])
-    check("manifest: contractVersion 미정 표기", man["contractVersion"].startswith("UNSET"))
-
-    # 판별력 확인 — 없는 키를 찾으면 None 이어야 한다 (아무거나 집어오면 안 된다)
-    man2 = build_manifest({}, 0, Path("/x"), Path("/y"), "", None)
-    check("없는 키 -> None (아무거나 안 집는다)", man2["actionSpec"]["horizon"] is None)
+    m3 = build_manifest({}, 0, Path("/x"), Path("/y"), "", None)
+    check("빈 cfg -> 전부 None",
+          m3["actionSpec"]["horizon"] is None and m3["runtimeSpec"]["obs_history_steps"] is None)
 
     try:
         import torch  # noqa: F401
@@ -259,7 +354,6 @@ def selftest() -> int:
     print(f"\n자체검증 {ok} / {total}")
     if not torch_ok:
         print("⚠️ torch 없음 — 저장·되읽기 경로는 **미실행**이다. 통과가 아니다.")
-        print("   실제 추출은 서버(~/envs/handoff312)에서 돌려 되읽기 검산까지 확인하라.")
         return 2
     return 0 if ok == total else 1
 
