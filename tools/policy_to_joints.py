@@ -64,11 +64,29 @@ GAP_MIN_M, GAP_MAX_M = 0.0, 0.09
 GAP_REJECT_ABOVE_M = 0.15    # 단위 사고 감지: mm 가 들어오면 64.23 등으로 즉시 걸린다
 EXEC_SLICE = (1, 5)          # evaluate.py 와 동일
 
-# 파지점 후보 (gripper body 로컬 z, m)
-TCP_CANDIDATES = {
-    "legacy_so101.yaml": -0.080,
-    "ver1_grasp_so101_ver1.yaml": -0.158118819,
-}
+# 파지점 기준 — 2026-09-19 URDF 실측으로 확정 🟢
+#
+# `so101_ver1.urdf`(AI/configs/real) 와 `so101_phone_holder.urdf`(handoff 시뮬) 둘 다
+# wrist_roll_link -> gripper_tcp 가 소수 9자리까지 **동일**하다.
+#     ver1          t = (2.1e-07, -5.64e-07, -0.158118819)  |t| = 0.158118819 m
+#     phone_holder  t = (2.1e-07, -5.64e-07, -0.158118819)  |t| = 0.158118819 m
+# 즉 handoff 시뮬 모델은 이미 ver1 기하다.
+#
+# 78.1mm 는 **진짜 기하 차이다** (2026-09-19 대조 🟢).
+#   third_party MJCF `so101_new_calib.xml:100` 의 body "gripper" 는
+#     pos (5.55112e-17, -0.0611, 0.0181)  quat (0.0172091,-0.0172091,0.706897,0.706897)
+#   URDF joint `wrist_roll` 은
+#     xyz (0, -0.0611, 0.0181)            rpy (1.5708, 0.04868, 3.14159)
+#   병진 동일, 회전 상대각 **0.0003도**. 같은 프레임이다.
+#   (판별력 확인: yaw 를 180도 틀리게 넣으면 179.9998도로 갈린다)
+#   따라서 so101.yaml 의 -0.080(스톡 SO-101 그리퍼, 패드 중심, 0827 실측)과
+#   ver1 의 -0.158118819 는 같은 자로 잰 수이고 **78.118819mm 차이가 실재한다.**
+#   도경 회신 "78mm" 와 일치.
+#
+#   ⚠️ 어시스턴트 정정 이력: 이 건을 두 번 뒤집었다. (1) 78.1mm 를 프레임 차이라고
+#      잘못 철회했고 (2) 회전까지 대조해서 원래 경고가 맞았음을 확인했다. 덮지 않는다.
+TCP_REFERENCE_BODY = "wrist_roll_link"
+TCP_VER1_Z_M = -0.158118819
 TCP_MATCH_TOL_M = 0.002
 
 
@@ -176,54 +194,60 @@ def apply_jaw_offset(R: np.ndarray, deg: float) -> np.ndarray:
 # ---------------------------------------------------------------- 파지점 실측
 
 def probe_tcp_offset(env) -> dict:
-    """Measure where site `tcp` sits in the gripper body local frame, then classify.
-    site `tcp` 가 gripper body 로컬 어디인지 재고 두 후보와 대조한다."""
+    """Measure site `tcp` in the reference link frame, from the model itself.
+    site `tcp` 를 기준 링크 프레임에서 모델로부터 직접 잰다. body 이름을 추측하지 않는다."""
     import mujoco
-    mujoco.mj_forward(env.model, env.data)
+    m = env.model
+    mujoco.mj_forward(m, env.data)
     d = env.data
-    bid = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, "gripper")
-    if bid < 0:
-        raise RuntimeError("body 'gripper' 를 찾지 못했다 — 모델이 다르다")
-    Rb = d.xmat[bid].reshape(3, 3)
-    pb = d.xpos[bid]
-    local = Rb.T @ (d.site("tcp").xpos - pb)
 
-    matches = {k: abs(float(local[2]) - v) for k, v in TCP_CANDIDATES.items()}
-    best = min(matches, key=matches.get)
-    ok = matches[best] <= TCP_MATCH_TOL_M
+    bodies = [mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, i) for i in range(m.nbody)]
+    sid = m.site("tcp").id
+    owner = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, int(m.site_bodyid[sid]))
+
+    rid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, TCP_REFERENCE_BODY)
+    if rid < 0:
+        raise SystemExit(
+            f"!! 기준 body '{TCP_REFERENCE_BODY}' 가 모델에 없다.\n"
+            f"   모델의 body {len(bodies)}개: {bodies}\n"
+            "   기준 링크 이름이 바뀌었다. TCP_REFERENCE_BODY 를 고쳐라.")
+
+    Rr = d.xmat[rid].reshape(3, 3)
+    pr = d.xpos[rid]
+    local = Rr.T @ (d.site("tcp").xpos - pr)
+    dz = abs(float(local[2]) - TCP_VER1_Z_M)
     return {
+        "reference_body": TCP_REFERENCE_BODY,
+        "site_owner_body": owner,
         "site_tcp_local_m": [float(v) for v in local],
         "z_local_m": float(local[2]),
-        "candidates_m": TCP_CANDIDATES,
-        "abs_diff_m": matches,
-        "matched": best if ok else None,
+        "norm_m": float(np.linalg.norm(local)),
+        "ver1_expected_z_m": TCP_VER1_Z_M,
+        "abs_diff_m": dz,
         "tolerance_m": TCP_MATCH_TOL_M,
-        "is_ver1": bool(ok and best.startswith("ver1")),
+        "is_ver1": bool(dz <= TCP_MATCH_TOL_M),
+        "n_bodies": len(bodies),
     }
 
 
 def tcp_gate(probe: dict, override: float | None) -> None:
-    """Refuse to emit a trajectory when the pinch point is not the real gripper's.
-    파지점이 실물 것이 아니면 궤적을 내놓지 않는다."""
+    """Refuse to emit a trajectory when the model's pinch point is not ver1's.
+    모델의 파지점이 ver1 이 아니면 궤적을 내놓지 않는다."""
     if override is not None:
         print(f"[TCP] --tcp-offset-m {override} 명시됨 — 게이트 건너뜀 (사용자 책임)")
         return
-    z = probe["z_local_m"]
-    print(f"[TCP] site tcp 로컬 z = {z:+.9f} m")
-    for k, v in TCP_CANDIDATES.items():
-        print(f"      {k:<32} {v:+.9f}  차이 {abs(z - v) * 1000:8.3f} mm")
-    if probe["matched"] is None:
-        raise SystemExit(
-            "!! 파지점이 두 후보 어느 쪽과도 "
-            f"{TCP_MATCH_TOL_M * 1000:.0f}mm 안에서 맞지 않는다. 궤적을 내지 않는다.\n"
-            "   --tcp-offset-m 으로 명시하거나 모델을 바꿔라.")
+    print(f"[TCP] 기준 {probe['reference_body']} · site 소유 body {probe['site_owner_body']} "
+          f"· 모델 body {probe['n_bodies']}개")
+    print(f"      site tcp 로컬 = {np.round(probe['site_tcp_local_m'], 9)}  "
+          f"|t| = {probe['norm_m']:.9f} m")
+    print(f"      ver1 기대 z   = {probe['ver1_expected_z_m']:+.9f} m  "
+          f"차이 {probe['abs_diff_m'] * 1000:.3f} mm")
     if not probe["is_ver1"]:
         raise SystemExit(
-            f"!! 모델의 파지점이 '{probe['matched']}' 다. 실물은 ver1 "
-            f"({TCP_CANDIDATES['ver1_grasp_so101_ver1.yaml']:+.9f}) 이고 차이가 "
-            f"{abs(TCP_CANDIDATES['ver1_grasp_so101_ver1.yaml'] - probe['z_local_m']) * 1000:.1f}mm 다.\n"
-            "   이대로 실물에 올리면 접근축으로 그만큼 상수 편향이 붙는다.\n"
-            "   파지 여유는 ±25mm 뿐이다. ver1 모델을 쓰거나 --tcp-offset-m 을 명시하라.")
+            f"!! 파지점이 ver1({TCP_VER1_Z_M:+.9f} m) 과 "
+            f"{probe['abs_diff_m'] * 1000:.1f}mm 어긋난다. 궤적을 내지 않는다.\n"
+            "   파지 여유는 ±25mm = (개구 90 − 물체 41)/2 뿐이고 이런 상수 편향은\n"
+            "   학습이 지우지 못한다. 모델을 바꾸거나 --tcp-offset-m 을 명시하라.")
     print("[TCP] ver1 파지점 확인. 통과")
 
 
@@ -394,17 +418,21 @@ def selftest() -> int:
           np.allclose(apply_jaw_offset(R, 0.0), R)
           and not np.allclose(apply_jaw_offset(R, 92.79), R))
 
-    # [9] TCP 게이트 — 레거시 모델이면 반드시 죽어야 한다
-    legacy = {"z_local_m": -0.080, "matched": "legacy_so101.yaml", "is_ver1": False}
+    # [9] TCP 게이트 — ver1 이 아니면 반드시 죽어야 한다
+    legacy = {"reference_body": TCP_REFERENCE_BODY, "site_owner_body": "x",
+              "site_tcp_local_m": [0, 0, -0.080], "z_local_m": -0.080,
+              "norm_m": 0.080, "ver1_expected_z_m": TCP_VER1_Z_M,
+              "abs_diff_m": abs(-0.080 - TCP_VER1_Z_M), "tolerance_m": TCP_MATCH_TOL_M,
+              "is_ver1": False, "n_bodies": 3}
     try:
         tcp_gate(legacy, None)
         died = False
     except SystemExit:
         died = True
-    check("레거시 파지점 -> 게이트가 죽인다", died)
+    check("ver1 아닌 파지점 -> 게이트가 죽인다", died)
 
-    # [9b] ver1 이면 통과
-    ver1 = {"z_local_m": -0.158118819, "matched": "ver1_grasp_so101_ver1.yaml", "is_ver1": True}
+    ver1 = dict(legacy, z_local_m=TCP_VER1_Z_M, site_tcp_local_m=[0, 0, TCP_VER1_Z_M],
+                norm_m=abs(TCP_VER1_Z_M), abs_diff_m=0.0, is_ver1=True)
     try:
         tcp_gate(ver1, None)
         passed = True
@@ -412,14 +440,22 @@ def selftest() -> int:
         passed = False
     check("ver1 파지점 -> 통과", passed)
 
-    # [9c] 어느 후보와도 안 맞으면 죽는다
-    none_m = {"z_local_m": -0.30, "matched": None, "is_ver1": False}
+    # 판별력: 허용치 바로 안/밖이 갈리는가
+    edge_in = dict(ver1, z_local_m=TCP_VER1_Z_M + 0.0019,
+                   abs_diff_m=0.0019, is_ver1=True)
+    edge_out = dict(ver1, z_local_m=TCP_VER1_Z_M + 0.0021,
+                    abs_diff_m=0.0021, is_ver1=False)
     try:
-        tcp_gate(none_m, None)
-        died = False
+        tcp_gate(edge_in, None)
+        a_ok = True
     except SystemExit:
-        died = True
-    check("미상 파지점 -> 게이트가 죽인다", died)
+        a_ok = False
+    try:
+        tcp_gate(edge_out, None)
+        b_ok = True
+    except SystemExit:
+        b_ok = False
+    check("허용치 1.9mm 통과 / 2.1mm 거부 (판별력)", a_ok and not b_ok)
 
     print(f"\n자체검증 {ok} / {total}")
     return 0 if ok == total else 1

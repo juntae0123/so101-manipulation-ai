@@ -103,7 +103,20 @@ AI/configs/grasp_so101_ver1.yaml   pinch_offset_local [0, 0, -0.158118819]  ver1
 ver1 은 jaw 축도 로컬 +Z 주위 +92.79도 돌아 있다. 현행 IK 는 jaw 를 구속하지 않으므로
 `wrist_roll` 로 보정해야 한다.
 
-→ 트랙 A 오프라인 IK 가 어느 값을 쓰는지 확인 대기. **추정하지 않는다.**
+**2026-09-19 추가 대조 🟢** — 두 값이 같은 프레임인지 끝까지 확인했다.
+MJCF `so101_new_calib.xml:100` 의 body `gripper` 와 URDF joint `wrist_roll` 은
+병진 동일·회전 상대각 **0.0003도**로 같은 프레임이다(판별력 확인: yaw 180도 → 179.9998도).
+**78.118819mm 차이는 실재한다.**
+
+다만 **현행 경로는 안전하다.** `so101_ver1.urdf` 와 handoff 의 `so101_phone_holder.urdf`
+는 서로 다른 파일인데(md5 다름, 링크 12 vs 15, diff 261줄) 둘 다
+`wrist_roll_link → gripper_tcp` 가 −0.158118819 로 소수 9자리까지 같다.
+→ **handoff 시뮬이 이미 ver1 기하다.** 위험은 AI 저장소 구 MJCF 경로로 어댑터를 짤 때만.
+`policy_to_joints.py` 가 게이트로 직접 잰다.
+
+⚠️ 어시스턴트가 이 건을 **두 번 뒤집었다**. 상세 `MEASURE_folds_real_0919.md` §6-3.
+
+→ 남은 확인은 jaw 뿐이다. 트랙 A 오프라인 IK 의 `wrist_roll` 보정 여부. **추정하지 않는다.**
 
 **(사-3) 로봇팔 카메라 마운트 자세 미상** 🟢
 
