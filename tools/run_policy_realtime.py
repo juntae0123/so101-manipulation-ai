@@ -367,7 +367,7 @@ def main() -> None:
                          "기록 소스(zarr/dir)의 시간축을 실행 주기와 맞춘다")
     ap.add_argument("--ik-reject-mm", type=float, default=None,
                     help="IK 위치 잔차가 이보다 크면 그 스텝을 버린다. "
-                         "기본 없음 — evaluate.py 는 거부하지 않는다(97%를 낸 그 경로). "
+                         "기본 없음 — evaluate.py 는 거부하지 않는다(97%%를 낸 그 경로). "
                          "실물에서 보수적으로 가고 싶을 때만 준다")
     ap.add_argument("--out", default=None)
     ap.add_argument("--umi-root", help="공식 UMI 저장소 경로 (diffusion_policy 의 부모)")
@@ -577,6 +577,11 @@ def main() -> None:
                   f"(에피소드 끝까지 안 갔거나, 정책이 안 닫는 것이다)")
     else:
         print("!! 명령이 하나도 안 나갔다. IK 가 전부 거부됐거나 프레임이 없다")
+    if not gap_track:
+        print(f"\n=== 교사강제 gap 궤적 · 0 관측 ===")
+        print("  --obs-from-zarr 를 안 줬다. 이 실행은 로봇 자세를 정책이 누적해서 만든다.")
+        print("  이미지는 녹화 시연, 자세는 정책 — 두 입력이 다른 세계라 파지 판정에 쓸 수 없다.")
+        print("  정책이 닫는지 보려면 --obs-from-zarr 로 다시 돌려라.")
     if gap_track:
         rows = [r for r, _, _ in gap_track]
         gt = np.array([g for _, g, _ in gap_track])
@@ -601,7 +606,18 @@ def main() -> None:
                   "스트림이 얼었는지 구분되지 않는다. 화면을 흔들어 다시 확인해라")
     if a.out:
         Path(a.out).write_text(json.dumps(
-            {"log": log, "gap_track": gap_track}, indent=1), encoding="utf-8")
+            {"run": {"teacher_forcing": bool(teacher),
+                     "camera": a.camera, "steps": a.steps,
+                     "action_steps": a.action_steps,
+                     "frame_stride": a.frame_stride,
+                     "no_robot": bool(a.no_robot), "dry_run": bool(a.dry_run),
+                     "jaw_offset_deg": a.jaw_offset_deg,
+                     "ik_reject_mm": a.ik_reject_mm,
+                     "checkpoint": a.checkpoint,
+                     "n_log": len(log), "n_gap_track": len(gap_track),
+                     "gap_track_empty_reason": (None if gap_track else
+                         "teacher_forcing off — 기록 대상이 없다 (결측 아님)")},
+             "log": log, "gap_track": gap_track}, indent=1), encoding="utf-8")
         print(f"→ {a.out}")
 
 
