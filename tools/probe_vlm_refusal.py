@@ -234,13 +234,17 @@ def main() -> int:
 
     import torch
     from PIL import Image
-    from transformers import AutoModelForVision2Seq, AutoProcessor
+    from transformers import AutoProcessor
 
+    # ⚠️ 2026-09-19 정정 — 초판은 `AutoModelForVision2Seq` 를 직접 불렀다가 즉시 죽었다.
+    #    비전-언어 auto 클래스 이름이 transformers 릴리스마다 바뀐다. 저장소에
+    #    **서버 실행으로 검증된 로더**가 이미 있었는데(`vlm/fp16_safety._load_model`,
+    #    세 클래스를 순서대로 시도) 내가 새로 짰다. 두 벌이면 갈린다 — 재사용한다.
+    from vlm.fp16_safety import _load_model
     from vlm.skill_choice import _process
 
     proc = AutoProcessor.from_pretrained(a.model)
-    model = AutoModelForVision2Seq.from_pretrained(
-        a.model, torch_dtype=torch.float16).to(a.device).eval()
+    model = _load_model(a.model, torch.float16, a.device)
     # 텍스트만 본다 — 0912·0914 에서 이미지가 두 번 다 도움이 안 됐다.
     # 프로세서가 이미지를 요구하므로 **검은 1x1** 을 넣고 그 사실을 기록한다.
     blank = Image.new("RGB", (64, 64), (0, 0, 0))

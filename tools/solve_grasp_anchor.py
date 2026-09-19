@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -248,19 +249,34 @@ def main() -> int:
     print(f"양성 대조 물체 위치 (시드 {a.control_seed}) {np.round(obj0, 4)}")
 
     def score(obj_xyz: np.ndarray) -> dict:
+        """Score one placement. Also carry the rotation-error split out.
+        배치 하나를 채점한다. **자세 오차 분해도 같이 들고 나온다** —
+        자유축(접근축 둘레) 성분과 나머지를 안 가르면 무해한 회전과 해로운 회전이
+        같은 숫자로 보인다 (거부 규칙은 안 바꾼다. 보고만 한다)."""
         n_ok = n_way = n_way_ok = 0
         why: dict[str, int] = {}
+        free: list[float] = []
+        perp: list[float] = []
         for e in eps:
             r = check_episode(env, e["chain"], align_for(obj_xyz, e["chain"][e["closure"]]),
                               limits, a.horizon, a.ik_tol, e["dts"], e["span"])
             n_ok += int(r["episode_ok"])
             n_way += r["waypoints"]
             n_way_ok += r["waypoints_ok"]
+            for k, dst in (("rot_free_axis_max_deg", free), ("rot_perp_max_deg", perp)):
+                v = r.get(k)
+                if v is not None and not math.isnan(v):
+                    dst.append(float(v))
             for w in r["reasons"]:
                 if w:
                     why[w.split(">")[0]] = why.get(w.split(">")[0], 0) + 1
+        med = lambda xs: round(float(np.median(xs)), 3) if xs else None  # noqa: E731
         return {"episodes_ok": n_ok, "episodes": len(eps),
-                "waypoints_ok": n_way_ok, "waypoints": n_way, "reject_reasons": why}
+                "waypoints_ok": n_way_ok, "waypoints": n_way, "reject_reasons": why,
+                "rot_free_axis_median_deg": med(free), "rot_free_axis_n": len(free),
+                "rot_perp_median_deg": med(perp), "rot_perp_n": len(perp),
+                "rot_split_note": "편별 최대값의 중앙. 자유축은 평행 그리퍼 측면파지의 "
+                                  "무해 성분. 거부 판정에는 안 썼다"}
 
     # ── 양성 대조 먼저. 여기서 0 이면 아무 결론도 내지 않는다.
     ctrl = score(obj0)
@@ -269,6 +285,11 @@ def main() -> int:
           f"웨이포인트 {ctrl['waypoints_ok']} / {ctrl['waypoints']}")
     if ctrl["reject_reasons"]:
         print(f"  거부 사유 {ctrl['reject_reasons']}")
+    print(f"  자세오차 분해 (편별 최대의 중앙): 자유축 {ctrl['rot_free_axis_median_deg']}도 "
+          f"(n={ctrl['rot_free_axis_n']}) · 수직 {ctrl['rot_perp_median_deg']}도 "
+          f"(n={ctrl['rot_perp_n']})")
+    print("  → 자유축이 크면 5도 임계가 무해한 회전까지 거부한 것이고, "
+          "수직이 크면 자세를 실제로 못 맞추는 것이다")
     if ctrl["waypoints_ok"] == 0:
         raise SystemExit(
             "!! 양성 대조가 0 이다. 0917 은 같은 앵커로 533/535 를 냈다.\n"
