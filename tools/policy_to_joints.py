@@ -723,7 +723,9 @@ def main() -> None:
         sys.exit(selftest())
     if not a.task:
         ap.error("--task 가 필요하다 (또는 --selftest)")
-    if not a.source_contract:
+    # --probe-tcp 는 계측만 하고 궤적을 안 내므로 출처가 필요 없다.
+    # 궤적을 낼 때만 강제한다.
+    if not a.probe_tcp and not a.source_contract:
         ap.error("--source-contract 가 필요하다 (official_umi / v10_direct). "
                  "기본값을 두지 않는다 — 안 정한 것과 정한 것이 같은 모양이 되면 안 된다")
 
