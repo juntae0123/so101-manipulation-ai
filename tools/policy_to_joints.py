@@ -62,7 +62,15 @@ ACTION_DIM = 10
 ROT6D_ROWS = True            # 첫 두 "행". 열이 아니다
 GAP_MIN_M, GAP_MAX_M = 0.0, 0.09
 GAP_REJECT_ABOVE_M = 0.15    # 단위 사고 감지: mm 가 들어오면 64.23 등으로 즉시 걸린다
-EXEC_SLICE = (1, 5)          # evaluate.py 와 동일
+EXEC_SLICE = (1, 5)          # evaluate.py 와 동일 (공식 UMI 경로)
+
+# 같은 청크라도 출처에 따라 실행 구간이 다르다 (황도경 확인, 2026-09-19).
+# 공식 UMI 정책 출력은 index 1..4, v10 직접 출력은 8개 전부가 미래 목표라 0..3.
+# **어느 경로인지 안 적으면 두 경로가 같은 모양으로 보인다.** 그래서 명시를 강제한다.
+SOURCE_CONTRACTS = {
+    "official_umi": (1, 5),      # f0918_*_B 등 공식 UMI diffusion 출력 — 이번 실물 경로
+    "v10_direct": (0, 4),        # 트랙 A v10 직접 출력
+}
 
 # 파지점 기준 — 2026-09-19 URDF 실측으로 확정 🟢
 #
@@ -192,6 +200,97 @@ def apply_jaw_offset(R: np.ndarray, deg: float) -> np.ndarray:
 
 
 # ---------------------------------------------------------------- 파지점 실측
+
+JAW_LEGACY_OFFSET_DEG = 92.789      # 레거시 +X jaw 기준 ver1 jaw 까지의 각
+JAW_MATCH_TOL_DEG = 5.0
+
+
+def probe_jaw_axis(env) -> dict:
+    """Measure the gripper's opening direction in the TCP frame, from the model.
+    그리퍼가 열리는 방향을 TCP 프레임에서 모델로부터 직접 잰다.
+
+    Why this exists / 왜 필요한가 (황도경 지적, 2026-09-19)
+    -----------------------------------------------------
+    ver1 `gripper_tcp` 축을 목표로 그대로 쓰면 **jaw 방향이 이미 반영돼 있다.**
+    그 위에 +92.79도를 또 넣으면 **이중 보정**이라 90도 넘게 틀어진다.
+    반대로 레거시 +X jaw 프레임이면 한 번은 넣어야 한다.
+
+    두 경우가 코드에서는 똑같이 생겼다 — 그래서 **재서 가른다.**
+    prismatic 그리퍼 관절의 축이 곧 턱이 열리는 방향이다. 그걸 TCP 프레임으로
+    옮겨 TCP 의 +X 와 이루는 각을 본다.
+    """
+    import mujoco
+    m = env.model
+    mujoco.mj_forward(m, env.data)
+    d = env.data
+
+    jnames = [mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_JOINT, i) for i in range(m.njnt)]
+    slides = [i for i, n in enumerate(jnames)
+              if n and "grip" in n.lower() and m.jnt_type[i] == mujoco.mjtJoint.mjJNT_SLIDE]
+    if not slides:
+        raise SystemExit(
+            "!! prismatic 그리퍼 관절을 못 찾았다. jaw 축을 잴 수 없다.\n"
+            f"   모델 관절 {len(jnames)}개: {jnames}\n"
+            "   이름 규칙이 바뀌었으면 여기를 고쳐라. 못 재면 보정값을 추측하지 않는다.")
+
+    jid = slides[0]
+    bid = int(m.jnt_bodyid[jid])
+    axis_world = d.xmat[bid].reshape(3, 3) @ np.asarray(m.jnt_axis[jid], dtype=np.float64)
+    n = np.linalg.norm(axis_world)
+    if n < 1e-12:
+        raise SystemExit("!! 그리퍼 관절 축의 길이가 0이다. 모델이 이상하다")
+    axis_world /= n
+
+    R_tcp = d.site("tcp").xmat.reshape(3, 3)
+    axis_tcp = R_tcp.T @ axis_world
+    # 턱은 양방향이라 부호가 의미 없다. 0~90도로 접는다.
+    c = abs(float(np.clip(axis_tcp[0], -1.0, 1.0)))     # TCP +X 와의 |cos|
+    angle_deg = float(np.degrees(np.arccos(c)))
+    return {
+        "joint": jnames[jid],
+        "n_gripper_slide_joints": len(slides),
+        "n_joints": len(jnames),
+        "jaw_axis_in_tcp": [float(v) for v in axis_tcp],
+        "angle_from_tcp_x_deg": angle_deg,
+        "tolerance_deg": JAW_MATCH_TOL_DEG,
+    }
+
+
+def jaw_gate(probe: dict, requested_deg: float) -> float:
+    """Decide the jaw correction from the measurement and refuse double correction.
+    보정값을 계측으로 정하고, 이중 보정을 거부한다.
+
+    돌려주는 값이 실제로 적용할 각이다. 사용자가 지정한 값이 계측과 어긋나면 죽는다."""
+    a = probe["angle_from_tcp_x_deg"]
+    tol = probe["tolerance_deg"]
+    print(f"[jaw] 관절 {probe['joint']} (그리퍼 slide {probe['n_gripper_slide_joints']} / "
+          f"전체 관절 {probe['n_joints']})")
+    print(f"      jaw 축(TCP 프레임) {np.round(probe['jaw_axis_in_tcp'], 6)}  "
+          f"TCP +X 와 {a:.3f}도")
+
+    if a <= tol:
+        need = JAW_LEGACY_OFFSET_DEG
+        why = (f"jaw 축이 TCP +X 와 {a:.2f}도 — **레거시 +X 프레임**이다. "
+               f"{JAW_LEGACY_OFFSET_DEG}도를 한 번 넣어야 한다")
+    elif abs(a - JAW_LEGACY_OFFSET_DEG) <= tol:
+        need = 0.0
+        why = (f"jaw 축이 TCP +X 와 {a:.2f}도 — **ver1 프레임**이다. "
+               "이미 반영돼 있으므로 추가 회전 0도")
+    else:
+        raise SystemExit(
+            f"!! jaw 축이 TCP +X 와 {a:.2f}도다. 레거시(0도)도 ver1"
+            f"({JAW_LEGACY_OFFSET_DEG}도)도 아니다 (허용 ±{tol}도).\n"
+            "   보정값을 추측하지 않는다. 모델·계약을 먼저 확인하라.")
+
+    print(f"      → {why}")
+    if abs(requested_deg - need) > 1e-9:
+        raise SystemExit(
+            f"!! --jaw-offset-deg {requested_deg} 는 계측과 어긋난다. 필요한 값은 "
+            f"{need} 도다.\n"
+            "   이중 보정하면 90도 넘게 틀어지고, 파지 여유 ±25mm 로는 확정적으로 빗나간다.\n"
+            f"   맞다고 확신하면 --jaw-offset-deg {need} 로 명시하라.")
+    return need
+
 
 def probe_tcp_offset(env) -> dict:
     """Measure site `tcp` in the reference link frame, from the model itself.
@@ -457,6 +556,33 @@ def selftest() -> int:
         b_ok = False
     check("허용치 1.9mm 통과 / 2.1mm 거부 (판별력)", a_ok and not b_ok)
 
+    # [16~20] jaw 게이트 — 이중 보정을 막는 것이 요점이다 (황도경 2026-09-19)
+    ver1_jaw = {"joint": "gripper_right", "n_gripper_slide_joints": 2, "n_joints": 8,
+                "jaw_axis_in_tcp": [0.0, 1.0, 0.0],
+                "angle_from_tcp_x_deg": 90.0, "tolerance_deg": JAW_MATCH_TOL_DEG}
+    legacy_jaw = dict(ver1_jaw, jaw_axis_in_tcp=[1.0, 0.0, 0.0],
+                      angle_from_tcp_x_deg=0.0)
+
+    check("ver1 jaw 프레임 -> 추가 회전 0도 (정답 아는 행)",
+          jaw_gate(ver1_jaw, 0.0) == 0.0)
+    check("레거시 jaw 프레임 -> 92.789도 필요",
+          jaw_gate(legacy_jaw, JAW_LEGACY_OFFSET_DEG) == JAW_LEGACY_OFFSET_DEG)
+    try:
+        jaw_gate(ver1_jaw, JAW_LEGACY_OFFSET_DEG)
+        caught = False
+    except SystemExit:
+        caught = True
+    check("판별력: ver1 인데 92.79도를 넣으면 거부 (이중 보정 차단)", caught)
+    try:
+        jaw_gate(dict(ver1_jaw, angle_from_tcp_x_deg=45.0), 0.0)
+        caught2 = False
+    except SystemExit:
+        caught2 = True
+    check("판별력: 둘 다 아닌 각(45도)이면 추측하지 않고 죽는다", caught2)
+    check("source_contract 두 경로의 실행 구간이 다르다",
+          SOURCE_CONTRACTS["official_umi"] == (1, 5)
+          and SOURCE_CONTRACTS["v10_direct"] == (0, 4))
+
     print(f"\n자체검증 {ok} / {total}")
     return 0 if ok == total else 1
 
@@ -484,7 +610,12 @@ def main() -> None:
     ap.add_argument("--action", help="(8,10) 액션 청크 .npy 또는 .json")
     ap.add_argument("--from-home", action="store_true", help="T_cur 를 태스크 홈 pose 로")
     ap.add_argument("--from-q", help="현재 관절각 5개 rad, 콤마 구분. T_cur 를 FK 로 구한다")
-    ap.add_argument("--exec-slice", default="1:5", help="기본 1:5 (evaluate.py 와 동일)")
+    ap.add_argument("--source-contract", choices=sorted(SOURCE_CONTRACTS),
+                    default="official_umi",
+                    help="액션 청크의 출처. 실행 구간이 여기서 정해진다 — "
+                         "official_umi 1..4 / v10_direct 0..3 (황도경 확인 2026-09-19)")
+    ap.add_argument("--exec-slice", default=None,
+                    help="실행 구간을 직접 지정 (예 1:5). 주면 --source-contract 기본값을 덮는다")
     ap.add_argument("--jaw-offset-deg", type=float, default=0.0,
                     help="ver1 jaw 보정. 명시 안 하면 0 이고 리포트에 그렇게 적힌다")
     ap.add_argument("--tcp-offset-m", type=float, default=None,
@@ -503,17 +634,26 @@ def main() -> None:
     from simulation.env import PickEnv                      # handoff 패키지
     env = make_env(PickEnv, a.task)
     probe = probe_tcp_offset(env)
+    jaw_probe = probe_jaw_axis(env)
 
     if a.probe_tcp:
-        print(json.dumps(probe, ensure_ascii=False, indent=2))
+        print(json.dumps({"tcp": probe, "jaw": jaw_probe}, ensure_ascii=False, indent=2))
         return
 
     tcp_gate(probe, a.tcp_offset_m)
+    jaw_deg = jaw_gate(jaw_probe, a.jaw_offset_deg)
 
     if not a.action:
         ap.error("--action 이 필요하다")
     action = load_action(a.action)
-    lo, hi = (int(v) for v in a.exec_slice.split(":"))
+    if a.exec_slice:
+        lo, hi = (int(v) for v in a.exec_slice.split(":"))
+        print(f"[구간] --exec-slice {a.exec_slice} 로 덮어씀 "
+              f"(source_contract {a.source_contract} 기본값은 "
+              f"{SOURCE_CONTRACTS[a.source_contract]})")
+    else:
+        lo, hi = SOURCE_CONTRACTS[a.source_contract]
+        print(f"[구간] source_contract={a.source_contract} → index {lo}..{hi-1}")
 
     if a.from_q:
         import mujoco
@@ -535,7 +675,7 @@ def main() -> None:
         ap.error("--from-home 또는 --from-q 중 하나가 필요하다")
 
     poses, gaps, diag = decode_chunk(action, T_cur, exec_slice=(lo, hi))
-    sol = solve_waypoints(env, poses, seed_q, a.jaw_offset_deg, a.ik_tol)
+    sol = solve_waypoints(env, poses, seed_q, jaw_deg, a.ik_tol)
 
     good = [s for s in sol if s["q"] is not None and s["reject_reason"] is None]
     print(f"\nIK 성공 {len(good)} / 요청 {len(sol)}  (청크 horizon {diag['horizon']}, "
@@ -545,15 +685,15 @@ def main() -> None:
         print(f"  [{s['index']}] {mark:<4} 잔차 {s['position_residual_m'] * 1000:7.3f} mm"
               f"  {s['reject_reason'] or ''}")
 
-    if a.jaw_offset_deg == 0.0:
-        print("\n⚠️ --jaw-offset-deg 미지정 → 0 을 썼다. ver1 jaw 는 레거시 대비 "
-              "+92.79도다 (grasp_so101_ver1.yaml). 트랙 A 확인 전까지 값을 넣지 않는다.")
+    print(f"\n[jaw] 실제 적용 {jaw_deg} 도 (계측 기반. 추측값 아님)")
 
     report = {
         "tcp_probe": probe,
         "chunk": diag,
         "T_cur": T_cur.tolist(),
-        "jaw_offset_deg": a.jaw_offset_deg,
+        "jaw_offset_deg": jaw_deg,
+        "jaw_probe": jaw_probe,
+        "source_contract": a.source_contract,
         "ik_tolerance_m": a.ik_tol,
         "waypoints": sol,
         "gripper_m": gaps,
