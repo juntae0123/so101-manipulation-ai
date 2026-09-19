@@ -205,6 +205,36 @@ def step_durations(z, n_steps: int) -> np.ndarray:
     return np.r_[d, d[-1]]                # 마지막은 직전 간격으로 채운다
 
 
+def rotation_error_split(R_target: np.ndarray, R_actual: np.ndarray) -> tuple[float, float]:
+    """Split the orientation error into the free axis and the rest [deg].
+    자세 오차를 **자유 축 성분**과 **나머지**로 가른다.
+
+    왜 나누나 / Why split
+    ---------------------
+    평행 그리퍼 측면 파지는 **접근축(TCP z) 둘레 회전이 자유**다 (프로젝트 기조).
+    그 축 둘레로 틀어진 것은 파지에 해가 없는데, 측지각 하나로 재면 해로운 오차와
+    **같은 숫자**가 된다. 그러면 "5도 초과 거부" 가 무해한 것까지 거부한다.
+
+    ⚠️ 이 함수는 **보고만 한다.** 거부 규칙은 바꾸지 않는다 — 결과를 보고 게이트를
+    옮기는 것이 되기 때문이다. 바꾸려면 사전등록이 먼저다.
+
+    Returns (접근축 둘레 성분, 나머지 성분) [deg].
+    """
+    Rerr = np.asarray(R_target).T @ np.asarray(R_actual)
+    # 회전벡터로 펴서 목표 프레임의 z(접근축)에 투영한다.
+    c = (float(np.trace(Rerr)) - 1.0) / 2.0
+    ang = float(np.arccos(max(-1.0, min(1.0, c))))
+    if ang < 1e-12:
+        return 0.0, 0.0
+    axis = np.array([Rerr[2, 1] - Rerr[1, 2],
+                     Rerr[0, 2] - Rerr[2, 0],
+                     Rerr[1, 0] - Rerr[0, 1]]) / (2.0 * np.sin(ang))
+    v = axis * ang                                  # 목표 프레임에서 본 회전벡터
+    about = abs(float(v[2]))                        # z = 접근축
+    perp = float(np.linalg.norm(v[:2]))
+    return float(np.degrees(about)), float(np.degrees(perp))
+
+
 def check_episode(env, chain: np.ndarray, T_base_home: np.ndarray, limits: dict,
                   horizon: int, ik_tol: float, dts: np.ndarray,
                   span: tuple[int, int] | None = None) -> dict:
@@ -221,7 +251,7 @@ def check_episode(env, chain: np.ndarray, T_base_home: np.ndarray, limits: dict,
     #    이름을 분리한다. 같은 이름을 두 뜻으로 쓰지 않는다.
     q_lo, q_hi = env.limits[:, 0], env.limits[:, 1]
 
-    qs, reasons, residuals = [], [], []
+    qs, reasons, residuals, splits = [], [], [], []
     seed = env.home_q.copy()
     first_fail = None
 
@@ -241,7 +271,9 @@ def check_episode(env, chain: np.ndarray, T_base_home: np.ndarray, limits: dict,
             Tc = env.tcp(env.ik_data)
             e_pos = float(np.linalg.norm(Tc[:3, 3] - pos))
             e_rot = geodesic_deg(R, Tc[:3, :3])
+            e_free, e_perp = rotation_error_split(R, Tc[:3, :3])
             residuals.append((e_pos, e_rot))
+            splits.append((e_free, e_perp))
             if np.any(q < q_lo - 1e-6) or np.any(q > q_hi + 1e-6):
                 why = "joint_limit"
             elif e_pos > ik_tol:
@@ -250,6 +282,7 @@ def check_episode(env, chain: np.ndarray, T_base_home: np.ndarray, limits: dict,
                 why = "rotation_residual>5deg"
         else:
             residuals.append((float("nan"), float("nan")))
+            splits.append((float("nan"), float("nan")))
         if why is None:
             qs.append(q)
             seed = q
@@ -301,6 +334,13 @@ def check_episode(env, chain: np.ndarray, T_base_home: np.ndarray, limits: dict,
         "required_uniform_time_scale": round(need_scale, 4),
         "position_residual_max_mm": round(max((r[0] for r in fin), default=float("nan")) * 1000, 3) if fin else None,
         "rotation_residual_max_deg": round(max((r[1] for r in fin), default=float("nan")), 3) if fin else None,
+        # 보고용 분해 (거부 규칙에는 안 쓴다)
+        "rot_free_axis_max_deg": round(max((a for a, b in splits if not math.isnan(a)),
+                                           default=float("nan")), 3) if splits else None,
+        "rot_perp_max_deg": round(max((b for a, b in splits if not math.isnan(b)),
+                                      default=float("nan")), 3) if splits else None,
+        "rot_split_note": "접근축 둘레 성분은 평행 그리퍼 측면파지에서 자유 축이다. "
+                          "거부 판정에는 쓰지 않았다",
         "reasons": reasons,
     }
 
@@ -359,6 +399,40 @@ def selftest() -> int:
     caught = cb["position_max_mm"] > 40.0
     print(f"[4] 고의 손상 감지 위치최대 {cb['position_max_mm']:.3f}mm", end="  ")
     print("OK" if caught else "!! 실패 — 망가진 데이터를 못 잡는다"); bad += not caught
+
+    # [N] 자세 오차 분해 — 정답 아는 행 + 판별력
+
+    def _rot(ax, deg):
+
+        a = np.deg2rad(deg)
+
+        v = np.asarray(ax, float) / np.linalg.norm(ax)
+
+        K = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+
+        return np.eye(3) + np.sin(a) * K + (1 - np.cos(a)) * K @ K
+
+
+    _f, _p = rotation_error_split(np.eye(3), _rot([0, 0, 1], 7.0))
+
+    _ok1 = abs(_f - 7.0) < 1e-6 and _p < 1e-6
+
+    _f2, _p2 = rotation_error_split(np.eye(3), _rot([1, 0, 0], 7.0))
+
+    _ok2 = _f2 < 1e-6 and abs(_p2 - 7.0) < 1e-6
+
+    _f3, _p3 = rotation_error_split(np.eye(3), np.eye(3))
+
+    print(f"[{'OK' if (_ok1 and _ok2 and _f3 == 0) else '!!'}] 자세오차 분해 "
+
+          f"자유축7도->({_f:.3f},{_p:.3f}) 수직7도->({_f2:.3f},{_p2:.3f}) "
+
+          f"동일->({_f3:.3f},{_p3:.3f})")
+
+    if not (_ok1 and _ok2):
+
+        raise SystemExit("!! 자세오차 분해가 축을 못 가른다")
+
 
     # [N] 이름 충돌 재발 방지 (2026-09-19). 관절 한계와 구간 인덱스가 같은 이름을
 
