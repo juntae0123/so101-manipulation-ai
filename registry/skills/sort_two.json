@@ -5,10 +5,10 @@
   "status": "planned",
   "policy": {
     "kind": "learned",
-    "contract_version": "0.1.0-provisional",
-    "ckpt_uri": "",
-    "trained_on": "",
-    "action_space": "joint_delta",
+    "contract_version": "umi_official/0.1.0",
+    "ckpt_uri": "outputs/f0918_B_42/checkpoints/latest.ckpt",
+    "trained_on": "umi_real_relative_20260911_v10 74편 중 train 60편 (분할시드 42) · warm start e2_C",
+    "action_space": "eef_relative_rot6d",
     "gate": null
   },
   "post_actions": [
@@ -23,28 +23,29 @@
       "params": {}
     }
   ],
-  "object_size_mm": [
-    15.0,
-    25.0
-  ],
+  "object_size_mm": [],
   "workspace_m": {
     "x": [
-      0.1,
-      0.25
+      0.34,
+      0.46
     ],
     "y": [
       -0.175,
       0.175
-    ]
+    ],
+    "_conditions": "측면 파지 · handoff SO-101 · base_height 0 · z 0.027~0.051 구간 실측. top-down 은 z 0.02~0.04 만 도달(513칸 중 28칸)이라 상면 파지 불가"
   },
   "robot": {
     "model": "so101",
-    "dof": 6
+    "dof": 5
   },
   "created_by": "김준태(트랙B)",
   "created_at": "2026-09-02T00:37:40+00:00",
   "notes": {
-    "plan": "A — 파지 정책 1개 공유. B(스킬별 독립 정책)는 확장 목표",
-    "blocked_by": "파지 정책이 게이트 미통과. 계약 skill 필드는 트랙 A 확인 대기"
+    "plan": "A — 파지 정책 1개를 5개가 공유. B(스킬별 독립 정책)는 확장 목표",
+    "blocked_by": "놓기 스크립트 0/5 · 실물 롤아웃 0건(1a·1b 안전절차 승인 대기) · 5스킬 대상물 미확정(HW)",
+    "action_space_meaning": "T_next = T_cur @ A_relative · 회전은 행렬의 첫 두 '행' · gap 절대값 m · 10Hz 8점 · 실행 구간 index 1..4 (0-based)",
+    "ckpt_sha256": "abb8a77d13805c2b41dd99d88df12855aa5b3ff6e747afec6975c1c1798ad766",
+    "_updated_0919": "dof 6→5(실측 5자유도+그리퍼) · action_space joint_delta→eef_relative_rot6d · workspace 도달 포락선 실측으로 교체 · object_size_mm 기획서값 폐기(대상물 미확정) · 근거 MEASURE_folds_real_0919 · DECISIONS_AI_0918_model_and_be(D-AI-60/61)"
   }
 }
