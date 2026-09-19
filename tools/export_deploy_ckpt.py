@@ -71,13 +71,23 @@ def inspect(payload: dict) -> dict:
 
 
 def count_params(state: dict) -> int:
-    """Total element count of a state dict. 상태사전 전체 원소 수."""
-    n = 0
+    """Total element count of a state dict, refusing to report a silent zero.
+    상태사전 전체 원소 수. 조용한 0 을 보고하지 않는다.
+
+    ⚠️ 2026-09-19 정정 — 초판은 `except AttributeError: pass` 였다. 모든 값이
+    텐서가 아니어도 0 을 그냥 돌려줬다. "없음"과 "괜찮음"이 같은 출력이다.
+    이제 모수를 같이 세고, 센 항목이 0 이면 예외로 죽는다."""
+    n = counted = 0
+    total = len(state)
     for v in state.values():
-        try:
-            n += int(v.numel())
-        except AttributeError:
-            pass
+        numel = getattr(v, "numel", None)
+        if callable(numel):
+            n += int(numel())
+            counted += 1
+    if counted == 0:
+        raise ValueError(f"!! 텐서인 항목이 0 / {total} 이다. nParams 를 내지 않는다")
+    if counted < total:
+        print(f"   (주의) 텐서 {counted} / 전체 {total} 항목만 셌다")
     return n
 
 
@@ -94,6 +104,8 @@ def plain(v):
         if OmegaConf.is_config(v):
             return OmegaConf.to_container(v, resolve=True)
     except ImportError:
+        # omegaconf 가 없는 환경(수신측 스모크)에서는 아래 일반 경로로 내려간다.
+        # 이건 "못 찾았다"가 아니라 "이 환경엔 원래 없다"라서 조용해도 된다.
         pass
     if hasattr(v, "items"):
         return {str(k): plain(x) for k, x in v.items()}
@@ -372,6 +384,20 @@ def selftest() -> int:
     except TypeError:
         disc = True
     check("판별력: 변환 안 하면 json 이 죽는다", disc)
+
+    class FakeT:
+        def numel(self): return 7
+
+    check("nParams: 텐서만 세고 합이 맞는다",
+          count_params({"a": FakeT(), "b": FakeT()}) == 14)
+    check("nParams: 텐서 반 · 비텐서 반이어도 합이 맞는다",
+          count_params({"a": FakeT(), "b": "문자열"}) == 7)
+    try:
+        count_params({"a": "문자열", "b": 3})
+        zero_guard = False
+    except ValueError:
+        zero_guard = True
+    check("판별력: 텐서가 0개면 0 을 돌려주지 않고 죽는다", zero_guard)
 
     m3 = build_manifest({}, 0, Path("/x"), Path("/y"), "", None)
     check("빈 cfg -> 전부 None",
