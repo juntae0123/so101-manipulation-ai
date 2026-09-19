@@ -135,19 +135,93 @@ class V4l2Source:
         return bgr[:, :, ::-1].copy() if ok else None
 
 
+class HttpSource:
+    """Snapshot-per-read from a phone running as an IP webcam.
+    폰을 IP 웹캠으로 띄웠을 때, 읽을 때마다 스냅샷을 새로 받는다.
+
+    Why snapshots and not the MJPEG stream / 왜 스트림이 아니라 스냅샷인가
+    ------------------------------------------------------------------
+    MJPEG 스트림을 열어두면 디코더 버퍼에 프레임이 쌓인다. 우리는 0.4초에 한 번만
+    읽으므로, 읽을 때 나오는 것은 **몇 초 전 장면**일 수 있다. 그런데 낡은 프레임과
+    새 프레임은 **똑같이 생긴 배열**로 나온다 — 검사가 안 되는 모양이다.
+    스냅샷 GET 은 요청 시점 화면을 주므로 이 실패가 원천적으로 없다.
+
+    그래도 스트림이 얼어붙는 경우가 있어서, 직전 바이트와 완전히 같은 응답이
+    연속으로 오면 세어 두고 경고한다. **"얼었다"와 "정지한 장면"은 다르지만,
+    구분이 안 되면 최소한 숫자로 보여야 한다.**
+
+    IP 웹캠 앱은 보통 두 경로를 낸다 — `/shot.jpg`(스냅샷) 과 `/video`(MJPEG).
+    **스냅샷 경로를 준다.** `/video` 를 주면 거부한다.
+    """
+
+    def __init__(self, url: str, timeout: float = 3.0) -> None:
+        self.url = url
+        self.timeout = timeout
+        self.reads = 0
+        self.repeats = 0
+        self._last: bytes | None = None
+        low = url.lower()
+        if low.rstrip("/").endswith("/video") or "action=stream" in low:
+            raise SystemExit(
+                f"!! 스트림 경로다: {url}\n"
+                "   MJPEG 스트림은 버퍼에 쌓인 낡은 프레임을 새 프레임처럼 준다.\n"
+                "   스냅샷 경로를 줘라 (IP Webcam 앱이면 .../shot.jpg)")
+        first = self._fetch()
+        if first is None:
+            raise SystemExit(f"!! 첫 스냅샷을 못 받았다: {url}")
+        print(f"[카메라] http 스냅샷 {url} · 첫 프레임 {first.shape}")
+
+    def _fetch(self):
+        import urllib.request
+
+        import cv2
+        try:
+            with urllib.request.urlopen(self.url, timeout=self.timeout) as r:
+                raw = r.read()
+        except Exception as exc:                        # noqa: BLE001 — 사유를 남긴다
+            print(f"   !! 스냅샷 실패 {type(exc).__name__}: {exc}")
+            return None
+        if not raw:
+            print("   !! 스냅샷이 0바이트다")
+            return None
+        if raw == self._last:
+            self.repeats += 1
+        self._last = raw
+        bgr = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if bgr is None:
+            print(f"   !! JPEG 디코드 실패 ({len(raw)} bytes)")
+            return None
+        return bgr[:, :, ::-1].copy()
+
+    def read(self):
+        self.reads += 1
+        return self._fetch()
+
+    def report(self) -> str:
+        """Freshness with its denominator. 신선도를 모수와 함께."""
+        return f"http 스냅샷 {self.reads}회 · 직전과 동일 바이트 {self.repeats}회"
+
+
 def parse_camera(spec: str):
-    """One of v4l2:<i> / dir:<path> / zarr:<path>:<ep>. 셋 중 하나만."""
-    kind, _, rest = spec.partition(":")
-    if not rest:
-        raise SystemExit(f"!! --camera 형식이 아니다: {spec!r}. "
-                         "v4l2:0 / dir:/path / zarr:/path.zarr.zip:0")
+    """One of v4l2:<i> / dir:<path> / zarr:<path>:<ep> / http(s)://<snapshot-url>.
+    넷 중 하나만."""
+    usage = ("v4l2:0 / dir:/path / zarr:/path.zarr.zip:0 / "
+             "http://192.168.0.5:8080/shot.jpg")
+    kind, sep, rest = spec.partition(":")
+    if kind in ("http", "https"):
+        # URL 전체가 주소다. rest 만 떼면 스킴이 날아간다.
+        if not rest.startswith("//") or len(rest) <= 2:
+            raise SystemExit(f"!! URL 이 아니다: {spec!r}. 예) {usage.split(' / ')[-1]}")
+        return HttpSource(spec)
+    if not sep or not rest:
+        raise SystemExit(f"!! --camera 형식이 아니다: {spec!r}. {usage}")
     if kind == "v4l2":
         return V4l2Source(int(rest))
     if kind == "dir":
         return DirSource(rest)
     if kind == "zarr":
         return ZarrSource(rest)
-    raise SystemExit(f"!! 모르는 카메라 종류 {kind!r}. v4l2 / dir / zarr 중 하나")
+    raise SystemExit(f"!! 모르는 카메라 종류 {kind!r}. v4l2 / dir / zarr / http 중 하나")
 
 
 # ──────────────────────────────────────────────── 관측 조립
@@ -185,19 +259,22 @@ def selftest() -> int:
         ok += bool(cond)
         print(f"[{total}] {name:<46} {'OK' if cond else '!! 실패'}  {detail}")
 
-    for bad in ("v4l2", "", "webcam:0", "zarr:onlypath"):
+    bad_specs = ("v4l2", "", "webcam:0", "zarr:onlypath",
+                 "http:", "http://", "https://192.168.0.5:8080/video")
+    rejected = 0
+    for bad in bad_specs:
         try:
             parse_camera(bad)
-            died = False
-        except SystemExit:
-            died = True
-        except Exception:                              # noqa: BLE001
-            died = True
-        if not died:
-            check(f"잘못된 --camera {bad!r} 거부", False)
-            break
-    else:
-        check("잘못된 --camera 4종 전부 거부", True)
+        except BaseException:                          # noqa: BLE001 — 죽기만 하면 된다
+            rejected += 1
+    check(f"잘못된 --camera 거부 {rejected} / {len(bad_specs)}",
+          rejected == len(bad_specs))
+
+    # 판별력 행: 형식이 맞는 URL 은 형식 검사를 통과해야 한다. 전부 거부하면
+    # 위 행은 공짜로 통과한다 — 그건 검사가 아니다. 네트워크는 안 탄다.
+    kind, sep, rest = "http://192.168.0.5:8080/shot.jpg".partition(":")
+    check("판별력: 정상 스냅샷 URL 은 형식 검사를 통과한다",
+          kind == "http" and rest.startswith("//") and len(rest) > 2)
 
     h = [{"a": np.zeros(3), "b": np.ones(1)} for _ in range(2)]
     s = stack_history(h)
@@ -274,7 +351,10 @@ def main() -> None:
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--checkpoint")
     ap.add_argument("--task")
-    ap.add_argument("--camera", help="v4l2:0 / dir:/path / zarr:/path.zarr.zip:0")
+    ap.add_argument("--camera",
+                    help="v4l2:0 / dir:/path / zarr:/path.zarr.zip:0 / "
+                         "http://192.168.0.5:8080/shot.jpg (폰 IP 웹캠 스냅샷 경로. "
+                         "/video 같은 스트림 경로는 거부한다)")
     ap.add_argument("--port", default="/dev/ttyTHS1")
     ap.add_argument("--no-robot", action="store_true",
                     help="팔 없이 돈다. 관절 상태를 IK 결과로 이어붙여 배선만 검증")
@@ -513,6 +593,12 @@ def main() -> None:
             print("  ⚠️ 기록 자체의 닫힘폭이 5mm 미만이다. 이 편으로는 판정하지 마라")
         print("  " + "  ".join(f"{r}:{g:.0f}/{p:.0f}" for r, g, p in gap_track[:12]))
         print("  (행:기록/예측 mm)")
+    if hasattr(cam, "report"):
+        print("\n=== 카메라 ===")
+        print("  " + cam.report())
+        if getattr(cam, "repeats", 0):
+            print("  ⚠️ 같은 바이트가 반복됐다. 장면이 정말 정지해 있었는지, "
+                  "스트림이 얼었는지 구분되지 않는다. 화면을 흔들어 다시 확인해라")
     if a.out:
         Path(a.out).write_text(json.dumps(
             {"log": log, "gap_track": gap_track}, indent=1), encoding="utf-8")
