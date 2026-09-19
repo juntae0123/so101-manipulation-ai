@@ -253,6 +253,9 @@ def cmd_collect(a) -> int:
 
     # 사양: 기준선 대비 낙폭이 --drop 이내인 가장 큰 |각도| · |높이|
     def tol(key: str) -> float:
+        # `== 0.0` / `!= 0.0` 는 의도한 동등 비교다. 이 값들은 계산 결과가 아니라
+        # ANGLES_DEG · HEIGHTS_MM 에 우리가 리터럴 0.0 으로 박아 넣은 것이라
+        # 부동소수 오차가 낄 자리가 없다.
         good = [abs(r[key]) for r in rows
                 if r["name"] != "DISC" and r[key] != 0.0
                 and (base - r["rate"]) * 100 <= a.drop
