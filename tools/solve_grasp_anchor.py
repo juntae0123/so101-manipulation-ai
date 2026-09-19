@@ -1,46 +1,45 @@
 """Where should the object sit so the grasp is reachable? Solved from the demos.
 대상물을 어디에 놓아야 파지가 도달권에 드는가. 시연에서 직접 푼다.
 
-Why this exists / 왜 만들었나
------------------------------
-`robot_base_alignment_applied: false` 다. 실물 베이스 정렬 좌표는 트랙 A(황도경)
-소관이고 아직 못 받았다. 그동안 시연 궤적을 시뮬 홈 pose 에 박아 놓고 재면
-목표점 대부분이 작업영역 밖에 떨어진다 (한 편에서 작업영역 안 3/80 🟢).
-그 숫자를 "5자유도가 모자라다" 로 읽으면 틀린다. **놓는 자리를 안 정했을 뿐이다.**
+⚠️ 2026-09-19 전면 수정 — 초판은 틀렸다
+--------------------------------------
+초판은 **시연 자체의 파지 자세를 유지한 채 위치와 월드 yaw 만** 흔들었다.
+파일럿에서 후보 72개 × 10편 = 720 IK 가 **전부 0** 이었다.
 
-이 도구는 정렬 좌표를 **기다리는 대신** 반대로 푼다 —
-*"파지 순간이 도달권에 들려면 물체를 어디에 놓아야 하나"* 를 탐색한다.
+왜 틀렸나: v10 은 `robot_base_alignment_applied: false` 다. 시연 궤적의 자세는
+**로봇 좌표계에 놓인 적이 없다.** 월드 z 둘레 회전만으로는 정렬되지 않는 자세를
+아무리 옮겨봐야 0 이 나온다. 그리고 이건 이미 답이 있던 문제였다 —
+`MEASURE_real_grasp_ik_0917` 이 **앵커를 시뮬 파지 pose 에 박으면 533/535 = 99.6%**
+라고 적어놨다. 나는 그 문서를 읽고도 다른 앵커를 새로 만들었다.
 
-⚠️ 이것은 실물 베이스 캘리브레이션이 **아니다.** 우리가 내는 **제안값**이고,
-   실물에 올리기 전에 황도경·김현석 확인이 필요하다. 리포트 모든 행에 그렇게 적힌다.
+지금 판: 0917 과 **같은 앵커식**을 쓰고, 자유 변수는 **물체를 놓는 자리** 하나다.
 
-무엇을 성공으로 보나 / What counts as success
----------------------------------------------
-**파지 순간 전후만 본다.** 시연 전체 궤적이 아니다. 제품 기조가 결과 모방이므로
-접근 경로는 로봇이 스스로 계획한다. 전체 궤적으로 재면 숫자가 통째로 부풀려진다
-(2026-09-17 실증: 전체궤적 29.2% vs 파지기준 533/535 = 99.6%).
+    T_grasp_sim = 물체 위치로부터 전문가 식 그대로 계산 (접근 방향이 자세를 정한다)
+    T_align     = T_grasp_sim @ inv(chain[closure])
+    T_base[t]   = T_align @ chain[t]
 
-어떻게 / How
-------------
-한 후보 배치 (p, yaw) 에 대해 정렬 변환을 이렇게 만든다.
+즉 묻는 것은 *"물체를 (x, y) 에 놓으면 파지 순간이 도달권에 드는가"* 다.
+자세는 자유 변수가 아니다 — 물체 위치가 접근 방향을 정하고 접근 방향이 자세를 정한다.
 
-    T_align(p, yaw) = Trans(p) @ Rz(yaw) @ Trans(-g)      g = chain[closure] 의 위치
+양성 대조 (없으면 아무 결론도 안 낸다)
+--------------------------------------
+시드 0 의 **실제 물체 위치**를 후보에 반드시 넣고, 그 조건이 통과하는지 먼저 본다.
+그건 0917 과 정확히 같은 설정이므로 높게 나와야 한다. **0 이면 도구가 틀린 것이고,
+그 상태에서 "어디에 놔도 안 된다" 는 결론을 내지 않는다.**
+초판에는 이 행이 없었다. 그래서 0/720 을 놓고 데이터 탓을 할 뻔했다.
 
-이러면 `T_align @ chain[closure]` 의 위치가 정확히 p 가 되고, 자세는 시연 자세를
-월드 z 축으로 yaw 만큼 돌린 것이 된다. 그 다음은 **검증된 계측기를 그대로 쓴다** —
-`check_real_traj_ik.check_episode(env, chain, T_align, ..., span=파지구간)`.
-
-2단 탐색. 1단은 닫힘 pose 하나만 IK 로 찍어 후보를 거르고(싸다), 2단은 살아남은
-후보에만 파지 구간 전체를 돌린다. 1단만 보고 결론 내지 않는다.
+무엇을 성공으로 보나
+--------------------
+**파지 순간 −pre ~ +post 행만.** 시연 전체 궤적이 아니다.
 
 Usage
 -----
   # [서버]
   ~/envs/handoff312/bin/python AI/tools/solve_grasp_anchor.py --selftest
-  ~/envs/handoff312/bin/python AI/tools/solve_grasp_anchor.py --dataset ~/S15P21A103_umi/AI/datasets/umi_real_relative_20260911_v10 --task ~/handoff/configs/can_side.yaml --out ~/handoff/outputs/grasp_anchor.json
+  cd ~/handoff && ~/envs/handoff312/bin/python ~/S15P21A103/AI/tools/solve_grasp_anchor.py --dataset <v10> --task configs/can_side.yaml --reference-demos ~/handoff/outputs/demos_6000 --out ~/handoff/outputs/grasp_anchor.json
 
-되돌리기 / Reverting
---------------------
+되돌리기
+--------
 이 파일을 지우면 끝이다. 데이터셋·설정·handoff 를 하나도 건드리지 않는다.
 출력은 `--out` JSON 하나뿐이다.
 """
@@ -65,29 +64,28 @@ from check_real_traj_ik import (  # noqa: E402  — 검증된 계측기를 재�
     step_durations,
 )
 
-# Measured reach envelope, side grasp, handoff SO-101, base_height 0. 🟢
-# 도달 포락선 실측(측면 파지). 발명값이 아니다 — MEASURE_task2_envelope_0916.
-ENVELOPE = {"x": (0.34, 0.46), "y": (-0.175, 0.175), "z": (0.027, 0.051)}
+# 측면 파지 도달 포락선 실측 (handoff SO-101, base_height 0) — MEASURE_task2_envelope_0916
+ENVELOPE_X = (0.34, 0.46)
+ENVELOPE_Y = (-0.175, 0.175)
 
 
-def rz(yaw_rad: float) -> np.ndarray:
-    """Rotation about world z as a 4x4.
-    월드 z 축 회전을 4x4 로."""
-    c, s = np.cos(yaw_rad), np.sin(yaw_rad)
+def grasp_pose_for_object(obj_xyz: np.ndarray) -> np.ndarray:
+    """The sim expert's side-grasp TCP pose for an object at this position.
+    이 위치에 물체가 있을 때 시뮬 전문가가 쓰는 측면 파지 TCP pose.
+
+    `convert_v10_to_umi.sim_grasp_pose` 와 **같은 식**이다. 거기서 그대로 가져왔다.
+    자세는 접근 방향 `ap` 가 정한다 — 즉 **물체 위치가 자세를 정한다.**
+    자세를 따로 흔들 자유 변수로 두면 전문가가 실제로 내는 자세와 달라진다."""
+    obj = np.asarray(obj_xyz, dtype=np.float64)
+    ap = np.r_[obj[:2] - np.array([0.04, 0.0]), 0.0]
+    n = np.linalg.norm(ap)
+    if n < 1e-9:
+        raise ValueError("물체가 접근 기준점과 같은 위치다")
+    ap = ap / n
     T = np.eye(4)
-    T[:3, :3] = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    T[:3, :3] = np.column_stack([np.cross([0, 0, 1], ap), [0, 0, 1], ap])
+    T[:3, 3] = obj + ap * 0.013
     return T
-
-
-def align_transform(grasp_pos: np.ndarray, p: np.ndarray, yaw_rad: float) -> np.ndarray:
-    """Place this episode's grasp point at p, yawed by yaw_rad.
-    이 편의 파지점을 p 에 놓고 yaw 만큼 돌리는 정렬 변환.
-
-    T = Trans(p) @ Rz(yaw) @ Trans(-g).  순서를 바꾸면 위치가 틀어진다."""
-    tp, tg = np.eye(4), np.eye(4)
-    tp[:3, 3] = np.asarray(p, dtype=np.float64)
-    tg[:3, 3] = -np.asarray(grasp_pos, dtype=np.float64)
-    return tp @ rz(yaw_rad) @ tg
 
 
 def load_episodes(dataset: Path, horizon: int, pre: int, post: int,
@@ -117,15 +115,17 @@ def load_episodes(dataset: Path, horizon: int, pre: int, post: int,
     return used, dropped
 
 
-def grid(n_x: int, n_y: int, n_z: int, n_yaw: int) -> list[tuple[np.ndarray, float]]:
-    """Candidate placements inside the measured envelope.
-    실측 포락선 안의 후보 배치."""
-    xs = np.linspace(*ENVELOPE["x"], n_x)
-    ys = np.linspace(*ENVELOPE["y"], n_y)
-    zs = np.linspace(*ENVELOPE["z"], n_z)
-    yaws = np.linspace(-np.pi, np.pi, n_yaw, endpoint=False)
-    return [(np.array([x, y, z]), float(w))
-            for x in xs for y in ys for z in zs for w in yaws]
+def object_grid(z_obj: float, nx: int, ny: int) -> list[np.ndarray]:
+    """Candidate object positions. z comes from the object, not from us.
+    후보 물체 위치. z 는 물체가 정한다. 우리가 고르는 값이 아니다."""
+    return [np.array([x, y, z_obj])
+            for x in np.linspace(*ENVELOPE_X, nx)
+            for y in np.linspace(*ENVELOPE_Y, ny)]
+
+
+def align_for(obj_xyz: np.ndarray, chain_closure: np.ndarray) -> np.ndarray:
+    """0917 의 앵커식 그대로: T_align = T_grasp_sim @ inv(chain[closure])."""
+    return grasp_pose_for_object(obj_xyz) @ np.linalg.inv(chain_closure)
 
 
 def closure_reachable(env, ep: dict, T_align: np.ndarray, ik_tol: float) -> bool:
@@ -149,60 +149,54 @@ def closure_reachable(env, ep: dict, T_align: np.ndarray, ik_tol: float) -> bool
 
 
 def selftest() -> int:
-    """Geometry rows with known answers, plus deliberately wrong inputs.
-    정답을 아는 기하 검정 + 고의로 틀린 입력."""
+    """Known-answer rows plus deliberately wrong inputs.
+    정답 아는 행 + 고의로 틀린 입력."""
     ok = tot = 0
 
-    def check(label: str, cond: bool) -> None:
+    def check(label: str, cond: bool, detail: str = "") -> None:
         nonlocal ok, tot
         tot += 1
         ok += bool(cond)
-        print(f"  {'OK ' if cond else '!! '} [{tot}] {label}")
+        print(f"  {'OK ' if cond else '!! '} [{tot}] {label:<50} {detail}")
+
+    obj = np.array([0.40, 0.00, 0.051])
+    T = grasp_pose_for_object(obj)
+    check("파지 pose 가 정규직교", np.allclose(T[:3, :3].T @ T[:3, :3], np.eye(3), atol=1e-12))
+    check("파지 pose 가 오른손계", abs(np.linalg.det(T[:3, :3]) - 1.0) < 1e-12)
+    check("TCP 가 물체보다 접근점 쪽으로 13mm",
+          abs(np.linalg.norm(T[:3, 3] - obj) - 0.013) < 1e-12)
+    check("파지 높이 = 물체 중심 높이", abs(T[2, 3] - obj[2]) < 1e-12)
+    # 판별력: y 를 옮기면 접근 방향이 바뀌므로 자세가 바뀌어야 한다.
+    T2 = grasp_pose_for_object(np.array([0.40, 0.10, 0.051]))
+    check("판별력: 물체를 옮기면 자세도 바뀐다 (위치만이 아니다)",
+          not np.allclose(T[:3, :3], T2[:3, :3], atol=1e-6))
 
     rng = np.random.default_rng(0)
     R = np.linalg.qr(rng.normal(size=(3, 3)))[0]
     if np.linalg.det(R) < 0:
         R[:, 0] *= -1
-    chain_c = np.eye(4)
-    chain_c[:3, :3] = R
-    chain_c[:3, 3] = [0.11, -0.22, 0.33]
-    p = np.array([0.40, 0.02, 0.035])
+    cc = np.eye(4)
+    cc[:3, :3] = R
+    cc[:3, 3] = [0.11, -0.22, 0.33]
+    out = align_for(obj, cc) @ cc
+    check("앵커식: 닫힘 pose 가 정확히 T_grasp_sim 이 된다 (정답 아는 행)",
+          np.allclose(out, T, atol=1e-12))
+    # 판별력: 역행렬을 빼면 안 맞아야 한다.
+    check("판별력: inv(chain[closure]) 를 빼면 안 맞는다",
+          not np.allclose(grasp_pose_for_object(obj) @ cc, T, atol=1e-6))
 
-    T = align_transform(chain_c[:3, 3], p, 0.0)
-    out = T @ chain_c
-    check("yaw 0: 파지점이 정확히 p 로 간다",
-          np.allclose(out[:3, 3], p, atol=1e-12))
-    check("yaw 0: 자세가 그대로다", np.allclose(out[:3, :3], R, atol=1e-12))
-
-    yaw = np.deg2rad(37.0)
-    out = align_transform(chain_c[:3, 3], p, yaw) @ chain_c
-    check("yaw 37도: 위치는 여전히 p",
-          np.allclose(out[:3, 3], p, atol=1e-12))
-    check("yaw 37도: 자세가 Rz(37) @ R",
-          np.allclose(out[:3, :3], rz(yaw)[:3, :3] @ R, atol=1e-12))
-
-    # Discriminating row: the wrong composition order must NOT land on p.
-    # 판별력 행: 곱 순서를 바꾸면 p 에 안 가야 한다. 가면 이 검정은 힘이 없다.
-    tp, tg = np.eye(4), np.eye(4)
-    tp[:3, 3] = p
-    tg[:3, 3] = -chain_c[:3, 3]
-    wrong = (tg @ rz(yaw) @ tp) @ chain_c
-    check("판별력: 곱 순서를 뒤집으면 p 에 안 간다",
-          not np.allclose(wrong[:3, 3], p, atol=1e-6))
-
-    # Discriminating row: yaw must actually change the pose.
-    # 판별력 행: yaw 가 자세를 실제로 바꿔야 한다.
-    check("판별력: yaw 37도와 yaw 0 의 자세가 다르다",
-          not np.allclose((align_transform(chain_c[:3, 3], p, yaw) @ chain_c)[:3, :3],
-                          (align_transform(chain_c[:3, 3], p, 0.0) @ chain_c)[:3, :3]))
-
-    g = grid(3, 3, 2, 4)
-    check("격자 크기가 모수와 맞는다 (3*3*2*4 = 72)", len(g) == 72)
-    check("격자가 전부 포락선 안이다",
-          all(ENVELOPE["x"][0] - 1e-9 <= q[0][0] <= ENVELOPE["x"][1] + 1e-9
-              and ENVELOPE["y"][0] - 1e-9 <= q[0][1] <= ENVELOPE["y"][1] + 1e-9
-              and ENVELOPE["z"][0] - 1e-9 <= q[0][2] <= ENVELOPE["z"][1] + 1e-9
-              for q in g))
+    g = object_grid(0.051, 3, 3)
+    check("격자 크기가 모수와 맞는다 (3*3)", len(g) == 9)
+    check("격자 z 가 전부 물체 높이", all(abs(p[2] - 0.051) < 1e-12 for p in g))
+    check("격자가 포락선 안이다",
+          all(ENVELOPE_X[0] - 1e-9 <= p[0] <= ENVELOPE_X[1] + 1e-9
+              and ENVELOPE_Y[0] - 1e-9 <= p[1] <= ENVELOPE_Y[1] + 1e-9 for p in g))
+    try:
+        grasp_pose_for_object(np.array([0.04, 0.0, 0.05]))
+        died = False
+    except ValueError:
+        died = True
+    check("판별력: 접근점과 같은 위치면 죽는다", died)
 
     print(f"자체검증 {ok} / {tot}")
     return 0 if ok == tot else 1
@@ -211,20 +205,20 @@ def selftest() -> int:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
-    ap.add_argument("--dataset", help="v10 디렉터리")
-    ap.add_argument("--task", help="시뮬 task yaml")
-    ap.add_argument("--reference-demos", help="속도 예산 실측용 시뮬 시연 디렉터리")
+    ap.add_argument("--dataset")
+    ap.add_argument("--task")
+    ap.add_argument("--reference-demos")
     ap.add_argument("--out", default="grasp_anchor.json")
     ap.add_argument("--horizon", type=int, default=8)
     ap.add_argument("--pre", type=int, default=2)
     ap.add_argument("--post", type=int, default=6)
     ap.add_argument("--ik-tol", type=float, default=0.008)
-    ap.add_argument("--limit", type=int, default=0, help="앞에서 N편만 (0=전부)")
-    ap.add_argument("--nx", type=int, default=5)
-    ap.add_argument("--ny", type=int, default=5)
-    ap.add_argument("--nz", type=int, default=3)
-    ap.add_argument("--nyaw", type=int, default=8)
-    ap.add_argument("--top", type=int, default=5, help="2단으로 넘길 후보 수")
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--nx", type=int, default=7)
+    ap.add_argument("--ny", type=int, default=7)
+    ap.add_argument("--top", type=int, default=5)
+    ap.add_argument("--control-seed", type=int, default=0,
+                    help="양성 대조로 쓸 시뮬 시드 (그 시드의 실제 물체 위치)")
     a = ap.parse_args()
 
     if a.selftest:
@@ -241,81 +235,86 @@ def main() -> int:
     eps, dropped = load_episodes(Path(a.dataset).expanduser(), a.horizon,
                                  a.pre, a.post, a.limit)
     print(f"에피소드 사용 {len(eps)} / 읽음 {len(eps) + len(dropped)}")
-    for d in dropped[:5]:
-        print(f"   버림 {d['episode']}: {d['reason']}")
     if not eps:
-        raise SystemExit("!! 쓸 편이 0개다. 범위가 비었는지 먼저 본다")
+        raise SystemExit("!! 쓸 편이 0개다")
 
     limits = measure_reference_limits(Path(a.reference_demos).expanduser())
     print(f"속도 예산 실측 {limits['episodes_used']} / {limits['episodes_found']}편")
 
     from simulation.env import PickEnv
     env = PickEnv(task_path=str(Path(a.task).expanduser()))
-    env.reset(0)
-    T_home = env.tcp().copy()
-    print("시뮬 홈 EEF 위치", np.round(T_home[:3, 3], 4))
+    env.reset(a.control_seed)
+    obj0 = env.data.body("object").xpos.copy()
+    print(f"양성 대조 물체 위치 (시드 {a.control_seed}) {np.round(obj0, 4)}")
 
-    # 기준선 — 지금 하는 방식(시뮬 홈에 시작을 박는다)
-    base_ok = sum(1 for e in eps
-                  if check_episode(env, e["chain"], T_home, limits, a.horizon,
-                                   a.ik_tol, e["dts"], e["span"])["episode_ok"])
-    print(f"\n기준선(시뮬 홈 정렬): 파지구간 전부 통과 {base_ok} / {len(eps)}편\n")
+    def score(obj_xyz: np.ndarray) -> dict:
+        n_ok = n_way = n_way_ok = 0
+        why: dict[str, int] = {}
+        for e in eps:
+            r = check_episode(env, e["chain"], align_for(obj_xyz, e["chain"][e["closure"]]),
+                              limits, a.horizon, a.ik_tol, e["dts"], e["span"])
+            n_ok += int(r["episode_ok"])
+            n_way += r["waypoints"]
+            n_way_ok += r["waypoints_ok"]
+            for w in r["reasons"]:
+                if w:
+                    why[w.split(">")[0]] = why.get(w.split(">")[0], 0) + 1
+        return {"episodes_ok": n_ok, "episodes": len(eps),
+                "waypoints_ok": n_way_ok, "waypoints": n_way, "reject_reasons": why}
 
-    cands = grid(a.nx, a.ny, a.nz, a.nyaw)
-    print(f"1단 — 후보 {len(cands)}개 × {len(eps)}편 = {len(cands)*len(eps)} IK")
+    # ── 양성 대조 먼저. 여기서 0 이면 아무 결론도 내지 않는다.
+    ctrl = score(obj0)
+    print(f"\n=== 양성 대조 (0917 과 같은 설정) ===")
+    print(f"  편 {ctrl['episodes_ok']} / {ctrl['episodes']} · "
+          f"웨이포인트 {ctrl['waypoints_ok']} / {ctrl['waypoints']}")
+    if ctrl["reject_reasons"]:
+        print(f"  거부 사유 {ctrl['reject_reasons']}")
+    if ctrl["waypoints_ok"] == 0:
+        raise SystemExit(
+            "!! 양성 대조가 0 이다. 0917 은 같은 앵커로 533/535 를 냈다.\n"
+            "   데이터가 아니라 이 도구(또는 env·계약)가 틀린 것이다.\n"
+            "   '어디에 놔도 안 된다' 는 결론을 내지 않는다. 중단")
+
+    grid = object_grid(float(obj0[2]), a.nx, a.ny)
+    print(f"\n1단 — 물체 위치 후보 {len(grid)}개 × {len(eps)}편 = {len(grid)*len(eps)} IK")
     stage1 = []
-    for i, (p, yaw) in enumerate(cands):
+    for i, p in enumerate(grid):
         n = sum(1 for e in eps
-                if closure_reachable(env, e,
-                                     align_transform(e["chain"][e["closure"]][:3, 3], p, yaw),
-                                     a.ik_tol))
-        stage1.append({"p": p.tolist(), "yaw_deg": round(np.rad2deg(yaw), 2), "closure_ok": n})
-        if (i + 1) % 50 == 0:
-            print(f"   {i+1} / {len(cands)}")
+                if closure_reachable(env, e, align_for(p, e["chain"][e["closure"]]), a.ik_tol))
+        stage1.append({"obj": p.tolist(), "closure_ok": n})
+        if (i + 1) % 10 == 0:
+            print(f"   {i+1} / {len(grid)}  (최고 {max(r['closure_ok'] for r in stage1)})")
     stage1.sort(key=lambda r: -r["closure_ok"])
     print(f"1단 최고 닫힘통과 {stage1[0]['closure_ok']} / {len(eps)}편")
 
-    print(f"\n2단 — 상위 {a.top}개 후보에 파지 구간 전체")
+    print(f"\n2단 — 상위 {a.top}개에 파지 구간 전체")
     stage2 = []
     for r in stage1[:a.top]:
-        p, yaw = np.array(r["p"]), np.deg2rad(r["yaw_deg"])
-        n_ok = n_way = n_way_ok = 0
-        for e in eps:
-            res = check_episode(env, e["chain"],
-                                align_transform(e["chain"][e["closure"]][:3, 3], p, yaw),
-                                limits, a.horizon, a.ik_tol, e["dts"], e["span"])
-            n_ok += int(res["episode_ok"])
-            n_way += res["waypoints"]
-            n_way_ok += res["waypoints_ok"]
-        row = {**r, "episodes_ok": n_ok, "episodes": len(eps),
-               "waypoints_ok": n_way_ok, "waypoints": n_way}
-        stage2.append(row)
-        print(f"   p={np.round(p,3)} yaw={r['yaw_deg']:>7.2f}도  "
-              f"편 {n_ok}/{len(eps)} · 웨이포인트 {n_way_ok}/{n_way}")
+        s = score(np.array(r["obj"]))
+        stage2.append({**r, **s})
+        print(f"   물체 {np.round(np.array(r['obj']),3)}  "
+              f"편 {s['episodes_ok']}/{s['episodes']} · "
+              f"웨이포인트 {s['waypoints_ok']}/{s['waypoints']}")
     stage2.sort(key=lambda r: (-r["episodes_ok"], -r["waypoints_ok"]))
-
     best = stage2[0]
+
     out = {
-        "_WHAT_THIS_IS": "우리가 내는 배치 제안값이다. 실물 베이스 캘리브레이션이 아니다",
-        "_CONFIRM_WITH": "황도경(정렬 좌표) · 김현석(실제로 그 자리에 놓을 수 있는지)",
-        "_criterion": f"파지 순간 -{a.pre} ~ +{a.post} 행만 판정. 시연 전체 궤적이 아니다",
-        "_envelope_source": "MEASURE_task2_envelope_0916 측면파지 실측 (handoff SO-101, base_height 0)",
-        "episodes_used": len(eps),
-        "episodes_dropped": dropped,
-        "baseline_home_alignment_ok": base_ok,
-        "grid": {"nx": a.nx, "ny": a.ny, "nz": a.nz, "nyaw": a.nyaw, "candidates": len(cands)},
-        "best": best,
-        "stage2": stage2,
-        "stage1_top20": stage1[:20],
+        "_WHAT_THIS_IS": "물체를 놓을 자리 제안값이다. 실물 베이스 캘리브레이션이 아니다",
+        "_CONFIRM_WITH": "황도경(정렬 좌표) · 김현석(그 자리에 실제로 놓을 수 있는지)",
+        "_anchor": "T_align = T_grasp_sim(물체위치) @ inv(chain[closure]) — 0917 과 동일",
+        "_criterion": f"파지 순간 -{a.pre} ~ +{a.post} 행만. 시연 전체 궤적이 아니다",
+        "_positive_control": ctrl,
+        "episodes_used": len(eps), "episodes_dropped": dropped,
+        "grid": {"nx": a.nx, "ny": a.ny, "candidates": len(grid)},
+        "best": best, "stage2": stage2, "stage1_top20": stage1[:20],
     }
     Path(a.out).expanduser().write_text(json.dumps(out, ensure_ascii=False, indent=2),
                                         encoding="utf-8")
-    print(f"\n제안 배치  p = {np.round(np.array(best['p']), 4)} m · yaw = {best['yaw_deg']}도")
-    print(f"  파지구간 통과  {best['episodes_ok']} / {best['episodes']}편   "
-          f"(기준선 {base_ok} / {len(eps)})")
-    print(f"  웨이포인트     {best['waypoints_ok']} / {best['waypoints']}")
+    print(f"\n제안 물체 위치  {np.round(np.array(best['obj']), 4)} m")
+    print(f"  파지구간 통과 {best['episodes_ok']} / {best['episodes']}편  "
+          f"(양성 대조 {ctrl['episodes_ok']} / {ctrl['episodes']})")
     print(f"→ {a.out}")
-    print("\n⚠️ 이 값은 제안이다. 실물에 올리기 전에 황도경·김현석 확인.")
+    print("\n⚠️ 제안값이다. 실물에 올리기 전에 황도경·김현석 확인.")
     return 0
 
 
