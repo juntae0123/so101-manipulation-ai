@@ -40,7 +40,31 @@ EVAL_N=${EVAL_N:-20}
 
 cd "$R"
 
-echo "== 0. 착수 전 검사 =="
+# ⚠️ 2026-09-19 — 셸에 GROUPS 가 이미 있어서 `${GROUPS:-10}` 이 100 을 집었고,
+#    100편이 아니라 1000편을 생성했다. **해석된 값을 안 찍은 것이 원인**이다.
+#    "모수를 같이 찍는다" 를 스크립트에도 적용한다.
+LOCK=outputs/.${TAG}.lock
+if [ -e "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
+  echo "!! 이미 돌고 있다 (pid $(cat "$LOCK")). 중복 실행하면 같은 디렉터리를 서로 지운다"
+  exit 9
+fi
+echo $$ > "$LOCK"
+trap 'rm -f "$LOCK"' EXIT
+
+echo "== 0. 해석된 설정 =="
+printf '  %-10s %s\n' GROUPS "$GROUPS" PER "$PER" SEED0 "$SEED0" EPOCHS "$EPOCHS" \
+       BATCH "$BATCH" WORKERS "$WORKERS" GPU "$GPU" OBJECT "$OBJECT" \
+       EVAL_SEED "$EVAL_SEED" EVAL_N "$EVAL_N"
+echo "  총 생성 편수 $((GROUPS * PER)) · 학습 epoch $EPOCHS"
+if [ "$((GROUPS * PER))" -gt 200 ] && [ "${ALLOW_BIG:-0}" != "1" ]; then
+  echo "!! 총 편수 $((GROUPS * PER)) 는 사전등록(100편)보다 크다."
+  echo "   셸에 GROUPS/PER 가 남아 있지 않은지 확인하라: GROUPS=[$GROUPS] PER=[$PER]"
+  echo "   의도한 것이면 ALLOW_BIG=1 을 붙여라."
+  exit 8
+fi
+
+echo
+echo "== 0-1. 착수 전 검사 =="
 for f in configs/can_side.yaml configs/camera.yaml simulation/generate.py \
          umi_adapter/export.py umi_adapter/train.py simulation/evaluate.py; do
   [ -e "$f" ] || { echo "!! 없다: $f"; exit 2; }
