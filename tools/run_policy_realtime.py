@@ -242,6 +242,12 @@ def selftest() -> int:
     except ImportError as e:
         check(f"policy_to_joints import ({e})", False)
 
+    try:
+        from smoke_deploy_ckpt import _prepare_umi_path            # noqa: F401
+        check("UMI 경로 해결기를 재사용한다 (두 벌 금지)", True)
+    except ImportError as e:
+        check(f"smoke_deploy_ckpt._prepare_umi_path import ({e})", False)
+
     print(f"\n자체검증 {ok} / {total}")
     return 0 if ok == total else 1
 
@@ -264,6 +270,7 @@ def main() -> None:
     ap.add_argument("--jaw-offset-deg", type=float, default=0.0)
     ap.add_argument("--ik-tol", type=float, default=0.008)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--umi-root", help="공식 UMI 저장소 경로 (diffusion_policy 의 부모)")
     ap.add_argument("--yes", action="store_true")
     a = ap.parse_args()
 
@@ -276,6 +283,12 @@ def main() -> None:
     for need in ("checkpoint", "task", "camera"):
         if not getattr(a, need):
             ap.error(f"--{need} 가 필요하다")
+
+    # ⚠️ 공식 UMI(`diffusion_policy`)를 sys.path 에 먼저 올린다. 안 하면 hydra 가
+    #    'Error locating target' 로 죽는데 그건 체크포인트 문제가 아니라 환경 문제다.
+    #    smoke_deploy_ckpt 의 해결기를 **재사용한다** — 두 벌이면 갈린다.
+    from smoke_deploy_ckpt import _prepare_umi_path
+    print(f"[{_prepare_umi_path(a.umi_root)}]")
 
     import torch, dill, hydra                                        # noqa: E401
     import policy_to_joints as p2j
