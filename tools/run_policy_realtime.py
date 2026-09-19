@@ -248,6 +248,9 @@ def selftest() -> int:
     except ImportError as e:
         check(f"smoke_deploy_ckpt._prepare_umi_path import ({e})", False)
 
+    check("프레임 stride 기본값 = 실행 스텝 수 (시간축 일치)", ACTION_STEPS == 4,
+          f"{ACTION_STEPS}")
+
     print(f"\n자체검증 {ok} / {total}")
     return 0 if ok == total else 1
 
@@ -268,7 +271,13 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=40, help="재관측 횟수 상한")
     ap.add_argument("--action-steps", type=int, default=ACTION_STEPS)
     ap.add_argument("--jaw-offset-deg", type=float, default=0.0)
-    ap.add_argument("--ik-tol", type=float, default=0.008)
+    ap.add_argument("--frame-stride", type=int, default=None,
+                    help="재관측 1회당 넘길 프레임 수. 기본 = --action-steps. "
+                         "기록 소스(zarr/dir)의 시간축을 실행 주기와 맞춘다")
+    ap.add_argument("--ik-reject-mm", type=float, default=None,
+                    help="IK 위치 잔차가 이보다 크면 그 스텝을 버린다. "
+                         "기본 없음 — evaluate.py 는 거부하지 않는다(97%를 낸 그 경로). "
+                         "실물에서 보수적으로 가고 싶을 때만 준다")
     ap.add_argument("--out", default=None)
     ap.add_argument("--umi-root", help="공식 UMI 저장소 경로 (diffusion_policy 의 부모)")
     ap.add_argument("--yes", action="store_true")
@@ -373,6 +382,7 @@ def main() -> None:
     hist.append(hist[0])
     log = []
     sent = 0
+    rejected = 0
     try:
         for it in range(a.steps):
             raw = stack_history(hist[-2:])
@@ -403,8 +413,9 @@ def main() -> None:
                     continue
                 Tc = fk(q_new)
                 res = float(np.linalg.norm(Tc[:3, 3] - pos))
-                if res > a.ik_tol:
-                    print(f"  [{it}] IK 잔차 {res * 1000:.1f}mm > {a.ik_tol * 1000:.0f}mm — 건너뜀")
+                if a.ik_reject_mm is not None and res * 1000 > a.ik_reject_mm:
+                    print(f"  [{it}] IK 잔차 {res * 1000:.1f}mm > {a.ik_reject_mm:.0f}mm — 건너뜀")
+                    rejected += 1
                     continue
                 gap_new = float(np.clip(target[6], 0.0, 0.09))
 
@@ -419,7 +430,13 @@ def main() -> None:
                 log.append({"iter": it, "pos": pos.tolist(), "gap_m": gap_new,
                             "q": [float(v) for v in q_new], "ik_residual_m": res})
 
-            nxt = cam.read()
+            stride = a.frame_stride if a.frame_stride is not None else a.action_steps
+            nxt = None
+            for _ in range(stride):                 # 실행한 시간만큼 프레임을 넘긴다
+                f = cam.read()
+                if f is None:
+                    break
+                nxt = f
             if nxt is None:
                 print(f"  프레임 끝 (반복 {it + 1}/{a.steps})")
                 break
@@ -438,8 +455,16 @@ def main() -> None:
     if log:
         r = [x["ik_residual_m"] * 1000 for x in log]
         g = [x["gap_m"] * 1000 for x in log]
-        print(f"IK 잔차  중앙 {np.median(r):.2f}mm  최대 {max(r):.2f}mm")
-        print(f"gap      {min(g):.1f} ~ {max(g):.1f} mm   ← 닫히는 구간이 있어야 파지다")
+        print(f"IK 잔차  중앙 {np.median(r):.2f}mm  최대 {max(r):.2f}mm  "
+              f"(거부 {rejected} / 시도 {len(log) + rejected})")
+        print(f"gap      {min(g):.1f} ~ {max(g):.1f} mm")
+        obj = 41.0
+        if min(g) <= obj + 10:
+            print(f"         → 물체 폭 {obj:.0f}mm 근처까지 닫힌다. 파지 동작이 있다")
+        else:
+            print(f"         → 최소 {min(g):.1f}mm 로 물체 폭 {obj:.0f}mm 보다 "
+                  f"{min(g)-obj:.1f}mm 넓다. **이 구간에는 파지가 없다** "
+                  f"(에피소드 끝까지 안 갔거나, 정책이 안 닫는 것이다)")
     else:
         print("!! 명령이 하나도 안 나갔다. IK 가 전부 거부됐거나 프레임이 없다")
     if a.out:
