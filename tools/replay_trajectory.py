@@ -306,6 +306,33 @@ def selftest() -> int:
     print(f"[13] gap 0.15m (범위 밖) 거부  ", end="")
     print("OK" if caught else "!! 실패"); bad += (not caught)
 
+    # [14~17] HW 속도 상한 게이트 (2026-09-19)
+    # 비상정지가 릴레이 준비 단계라 **소프트웨어가 마지막 방벽**이다.
+    try:
+        speed_gate(3.0, 0.05, HW_MAX_JOINT_SPEED_RAD_S)   # 초판 기본값 = 1.047 rad/s
+        caught = False
+    except SystemExit:
+        caught = True
+    print("[14] 판별력: 초판 기본값 3도/0.05s (=1.047 rad/s) 거부  ", end="")
+    print("OK" if caught else "!! 실패"); bad += (not caught)
+
+    v = speed_gate(0.85, 0.05, HW_MAX_JOINT_SPEED_RAD_S)
+    ok = v <= HW_MAX_JOINT_SPEED_RAD_S + 1e-9
+    print(f"[15] 현재 기본값 {v:.4f} rad/s <= 상한  ", end="")
+    print("OK" if ok else "!! 실패"); bad += (not ok)
+
+    ok = abs(HW_MAX_JOINT_SPEED_RAD_S - 0.3) < 1e-12
+    print(f"[16] 상한이 HW 회신값 0.3 rad/s  ", end="")
+    print("OK" if ok else "!! 실패"); bad += (not ok)
+
+    try:
+        speed_gate(1.0, 0.0, HW_MAX_JOINT_SPEED_RAD_S)
+        caught = False
+    except SystemExit:
+        caught = True
+    print("[17] 판별력: period 0 은 나눗셈 전에 거부  ", end="")
+    print("OK" if caught else "!! 실패"); bad += (not caught)
+
     print(f"\n자체검증 {'통과' if bad == 0 else f'실패 {bad}건'}")
     return 1 if bad else 0
 
@@ -322,6 +349,34 @@ def read_all(bus: Bus) -> tuple[list[float] | None, float | None, int]:
             q.append(tick_to_joint(j, t)); okn += 1
     gt = bus.position(GRIPPER[1])
     return q, (tick_to_gripper(gt) if gt is not None else None), okn
+
+
+HW_MAX_JOINT_SPEED_RAD_S = 0.3
+"""HW(김현석) 가 실물에 건 관절 최대 속도. 2026-09-19 회신 🟢
+
+⚠️ 초판 기본값(`--max-step-deg 3.0` · `--period 0.05`)은 3/0.05 = 60 도/초 =
+**1.047 rad/s** 로 이 상한의 3.5배였다. 실물에 그대로 내보낼 뻔했다.
+비상정지가 아직 릴레이 준비 단계이므로 **소프트웨어가 마지막 방벽**이다."""
+
+
+def speed_gate(max_step_deg: float, period_s: float, limit_rad_s: float) -> float:
+    """Refuse a step size that exceeds the hardware speed limit.
+    하드웨어 속도 상한을 넘는 스텝 크기를 거부한다.
+
+    돌려주는 값은 실제 요구 속도 [rad/s]. 모수를 같이 찍기 위해 반환한다."""
+    if period_s <= 0:
+        raise SystemExit("!! --period 가 0 이하다")
+    implied = math.radians(max_step_deg) / period_s
+    print(f"속도 검사: {max_step_deg}도 / {period_s}s = {implied:.4f} rad/s "
+          f"· 상한 {limit_rad_s} rad/s")
+    if implied > limit_rad_s + 1e-9:
+        need = math.degrees(limit_rad_s * period_s)
+        raise SystemExit(
+            f"!! 요구 속도 {implied:.4f} rad/s 가 상한 {limit_rad_s} 를 넘는다.\n"
+            f"   --max-step-deg {need:.3f} 이하로 낮추거나 --period 를 "
+            f"{math.radians(max_step_deg)/limit_rad_s:.4f} 이상으로 올려라.\n"
+            "   비상정지가 물리적으로 확인되지 않은 상태다. 소프트웨어가 마지막 방벽이다.")
+    return implied
 
 
 def preflight(waypoints: list[list[float]], gaps: list | None = None) -> None:
@@ -363,13 +418,23 @@ def main() -> None:
     ap.add_argument("--trajectory", help="[[q1..q5], ...] 형태 JSON 파일")
     ap.add_argument("--gripper", type=float, default=None,
                     help="개구 m (0~0.09). 궤적이 6폭이면 쓰지 마라")
-    ap.add_argument("--max-step-deg", type=float, default=3.0)
+    # 0.3 rad/s x 0.05s = 0.859도. HW 상한에서 역산한 값이다 (초판 3.0 은 3.5배 초과였다)
+    ap.add_argument("--max-step-deg", type=float, default=0.85)
+    ap.add_argument("--max-joint-speed", type=float, default=HW_MAX_JOINT_SPEED_RAD_S,
+                    help="관절 최대 속도 [rad/s]. HW 회신 0.3. 넘으면 한 스텝도 안 움직인다")
     ap.add_argument("--period", type=float, default=0.05, help="명령 간격 초")
     ap.add_argument("--speed", type=int, default=300)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--yes", action="store_true", help="확인 프롬프트 생략")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
+
+    if not a.selftest:
+        print("=" * 56)
+        print("⚠️ 물리 비상정지는 **미확인** 상태다 (HW: 릴레이 준비만).")
+        print("   소프트웨어 검사가 마지막 방벽이다. 사람이 옆에 있어야 한다.")
+        print("=" * 56)
+        implied_speed = speed_gate(a.max_step_deg, a.period, a.max_joint_speed)
 
     if a.selftest:
         sys.exit(selftest())

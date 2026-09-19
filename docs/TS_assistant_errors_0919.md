@@ -234,3 +234,38 @@ echo $GROUPS           # 1008  (사용자 GID)
 **셸 스크립트는 자기가 무엇으로 돌고 있는지 맨 앞에서 찍는다.**
 그리고 변수 이름에 대문자 관용을 따르되 **셸 예약 이름은 피한다.**
 `bash -n` 도 `set -u` 도 이걸 못 잡는다 — 문법은 멀쩡하고 값만 틀리기 때문이다.
+
+---
+
+## 7. "카메라 링크 0개" — 범위를 잘못 잡았다
+
+### 무엇을 틀렸나
+`motor_control/urdf/so101_ver1.urdf` 링크 12개를 전수 확인하고
+**"로봇팔에 카메라 링크가 0개다"** 라고 단정했다. 브리핑·PDF·현석 회신·도경 회신
+네 군데에 나갔다.
+
+**handoff 에 `assets/robot/model/urdf/so101_phone_holder.urdf` 가 따로 있다. 15링크다.**
+```
+... gripper_tcp · gripper_width_link · modified_top_plate_link
+    · phone_bracket_link · phone_holder_link      ← 있다
+```
+지침에 *"검색 0건이면 범위가 완전한지 먼저 본다"* 라고 적어놓고 내가 어겼다.
+김현석이 *"기존 전달한 URDF 포함 handoff 자료 참조"* 라고 답한 것이 맞다.
+
+### 다만 문제가 사라진 것은 아니다
+`assets/robot/spec/frames_and_joints.json` 원문:
+```
+camera_optical_transform: null
+camera_note: "Phone holder CAD frame is NOT lens optical frame.
+              Existing capture/calibration assets remain outside this package."
+holder_to_fingers_identical_between_handheld_and_robot:
+              "user-confirmed, not independently measured"
+```
+**마운트 기하는 있고 렌즈 광학 프레임은 없다.** 우리가 필요한 것은 손목 기준
+**렌즈 광학중심** pose 다. 그리고 이건 같은 날 hand-eye 원점을 provisional 로
+격하한 것과 **같은 미측정 지점**이다.
+
+### 일반화
+**"X 가 없다"고 쓰기 전에 X 가 있을 법한 트리를 전부 세고 그 수를 같이 적는다.**
+오늘 나는 `링크 12개 전수` 라고 모수까지 찍었는데, **그 12개가 어느 파일의
+12개인지를 안 적었다.** 모수를 찍어도 범위를 안 적으면 같은 실패다.
