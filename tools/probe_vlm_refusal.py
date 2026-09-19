@@ -16,11 +16,23 @@ VLM 이 실행할 수 없는 지시를 거절하는가.
 비교할 수 없게 된다. **채점 규칙(답 토큰 평균 로그확률 argmax)은 그대로 베끼고**
 후보만 6개로 늘린 별도 경로를 둔다. 규칙이 같다는 것을 자체검증에서 확인한다.
 
+환경 — **`aiot_v100` 이다. `handoff312` 가 아니다** 🟢
+------------------------------------------------
+```
+aiot_v100     transformers 5.16.1 · torch 2.13.0+cu126   ← VLM 은 여기서
+handoff312    transformers 없음                          ← MuJoCo·정책 학습용
+handoff_eval  transformers 없음
+```
+2026-09-19 에 `handoff312` 로 돌렸다가 `ModuleNotFoundError: transformers` 로 즉사했다.
+**인자만 대조하고 환경을 안 봤다.** 같은 날 `MUJOCO_GL` 누락과 같은 모양이다.
+transformers 5.x 에서는 auto 클래스 이름이 또 바뀌므로 `_load_model`(세 클래스 순차
+시도)을 반드시 쓴다. 직접 `AutoModelForVision2Seq` 를 부르면 죽는다.
+
 Usage
 -----
   # [서버]
-  ~/envs/handoff312/bin/python AI/tools/probe_vlm_refusal.py --selftest
-  ~/envs/handoff312/bin/python AI/tools/probe_vlm_refusal.py --model Qwen/Qwen2.5-VL-3B-Instruct --device cuda:1 --out ~/handoff/outputs/vlm_refusal.json
+  ~/envs/aiot_v100/bin/python AI/tools/probe_vlm_refusal.py --selftest
+  ~/envs/aiot_v100/bin/python AI/tools/probe_vlm_refusal.py --model Qwen/Qwen2.5-VL-3B-Instruct --device cuda:6 --out ~/handoff/outputs/vlm_refusal.json
 
 되돌리기
 --------
