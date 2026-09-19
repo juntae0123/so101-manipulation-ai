@@ -74,13 +74,44 @@
 → 해소: 계약 `runtimeSpec` 에 함수 이름 + **인자 값**을 같이 적고, ROS/Jetson 쪽
    호출부를 눈으로 확인한다. 미완.
 
-**(사) hand-eye config 는 잠정본이다** 🟡
+**(사) ~~hand-eye config 는 잠정본이다~~ → 2026-09-19 해소** 🟢
 
-`AI/configs/real/umi_s22_canonical_pinch_side_grasp_provisional.json`
-(해시 `a7b492aa42e9d6744b22b174271f27d1`). `MEASURE_handeye_from_video_0912.md` 에서
-재구성했다. **마커 중심 대 손끝 26.6mm 모호성이 미해결**이고 파일 안에 `_UNRESOLVED`.
+~~마커 중심 대 손끝 26.6mm 모호성 미해결~~ — **오차가 아니라 정의 차이였다.**
+차이 (+1.4, +15.5, +26.6)mm 가 gap 28mm 구간에 걸쳐 상수이고,
+`AI/configs/so101.yaml:131` 주석이 *"파지점은 TCP site(손가락 끝)가 아니라 패드 사이 중심"*
+이라고 명시한다. **우리 t = 마커 중점 = 패드 사이 중심 = 계약 정의 = 시뮬 정의.**
 
-hand-eye 오차는 **상수 편향이라 학습이 지우지 못한다.** ±10mm 에서 재생 3/4.
+확정본 `AI/configs/real/umi_s22_canonical_pinch_side_grasp.json`
+(해시 `c1bab726a4be74421a78faf4ff5275fa`). 구본은 `_superseded/`.
+상세 `MEASURE_folds_real_0919.md` §5.
+
+⚠️ 어시스턴트가 0912 에 이미 판정된 것을 0918 에 다시 `_UNRESOLVED` 로 열었다.
+문서 요약만 보고 해석제한 절을 안 읽었다.
+
+**(사-2) 로봇 파지점 정의가 둘이다 — 78.1mm** 🟢 발견 / 🟡 적용 여부 미확인
+
+```
+AI/configs/so101.yaml              pinch_offset_local [0, 0, -0.080]        레거시
+AI/configs/grasp_so101_ver1.yaml   pinch_offset_local [0, 0, -0.158118819]  ver1 (실물)
+차이 78.118819 mm
+```
+
+`grasp_so101_ver1.yaml` 헤더: *"학습·수집 파이프라인은 configs/so101.yaml 을 그대로 쓴다."*
+**실물은 ver1 인데 파이프라인 기본값은 레거시다.**
+어댑터가 레거시 값을 쓰면 접근축으로 78.1mm 상수 편향 — 파지 여유 ±25mm 를 세 배 넘긴다.
+
+ver1 은 jaw 축도 로컬 +Z 주위 +92.79도 돌아 있다. 현행 IK 는 jaw 를 구속하지 않으므로
+`wrist_roll` 로 보정해야 한다.
+
+→ 트랙 A 오프라인 IK 가 어느 값을 쓰는지 확인 대기. **추정하지 않는다.**
+
+**(사-3) 로봇팔 카메라 마운트 자세 미상** 🟢
+
+`so101_ver1.urdf` 링크 12개 전수에 **카메라 링크 0개**. 현재 hand-eye 는 **시연 리그 기준**이다.
+폐루프(사다리 3단계)에는 로봇 쪽 마운트 자세가 필요하다. HW 요청 1번, 회신 대기.
+개루프 재생(1a·1b)에는 카메라가 루프에 없으므로 걸리지 않는다.
+
+hand-eye 계열 오차는 **상수 편향이라 학습이 지우지 못한다.** ±10mm 에서 재생 3/4.
 
 ---
 
