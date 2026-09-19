@@ -95,13 +95,24 @@ class ZarrSource:
         self.lo = 0 if e == 0 else int(ends[e - 1])
         self.hi = int(ends[e])
         self.arr = z["data"]["camera0_rgb"]
+        self.pos = z["data"]["robot0_eef_pos"]
+        self.rot = z["data"]["robot0_eef_rot_axis_angle"]
+        self.gw = z["data"]["robot0_gripper_width"]
         self.i = self.lo
+        self.last = self.lo
         print(f"[카메라] zarr {path} 편 {e}/{len(ends)} · 행 {self.lo}~{self.hi} "
               f"({self.hi - self.lo}프레임)")
+
+    def state(self, row: int) -> dict:
+        """Recorded proprioception for one row. 그 행의 기록된 자기수용 상태."""
+        return {"robot0_eef_pos": np.asarray(self.pos[row], float),
+                "robot0_eef_rot_axis_angle": np.asarray(self.rot[row], float),
+                "robot0_gripper_width": np.asarray(self.gw[row], float).reshape(1)}
 
     def read(self):
         if self.i >= self.hi:
             return None
+        self.last = self.i
         img = np.asarray(self.arr[self.i])
         self.i += 1
         if img.dtype != np.uint8:                      # 정규화돼 있으면 되돌린다
@@ -280,6 +291,10 @@ def main() -> None:
                          "실물에서 보수적으로 가고 싶을 때만 준다")
     ap.add_argument("--out", default=None)
     ap.add_argument("--umi-root", help="공식 UMI 저장소 경로 (diffusion_policy 의 부모)")
+    ap.add_argument("--obs-from-zarr", action="store_true",
+                    help="관측(자기수용)도 zarr 기록에서 준다. 교사강제. "
+                         "팔 상태와 화면이 갈리지 않아 **정책이 닫는지**를 순수하게 본다. "
+                         "제어를 재는 게 아니라 정책 출력을 재는 모드다")
     ap.add_argument("--yes", action="store_true")
     a = ap.parse_args()
 
@@ -369,9 +384,19 @@ def main() -> None:
     T0 = fk(q_cur)
     episode_start = np.r_[T0[:3, 3], Rotation.from_matrix(T0[:3, :3]).as_rotvec()]
 
+    teacher = a.obs_from_zarr
+    if teacher and not isinstance(cam, ZarrSource):
+        raise SystemExit("!! --obs-from-zarr 는 --camera zarr: 일 때만 된다")
+    if teacher:
+        print("[모드] 교사강제 — 자기수용도 기록에서 준다. 제어가 아니라 "
+              "**정책이 닫는가**를 잰다")
+
     def observe(rgb):
         masked = draw_predefined_mask(rgb.copy(), color=(0, 0, 0), mirror=False,
                                       gripper=True, finger=False)
+        if teacher:
+            st = cam.state(cam.last)
+            return {"camera0_rgb": tf(masked), **st}
         T = fk(q_cur)
         return {"camera0_rgb": tf(masked),
                 "robot0_eef_pos": T[:3, 3].copy(),
@@ -383,6 +408,7 @@ def main() -> None:
     log = []
     sent = 0
     rejected = 0
+    gap_track = []
     try:
         for it in range(a.steps):
             raw = stack_history(hist[-2:])
@@ -397,6 +423,10 @@ def main() -> None:
             with torch.inference_mode():
                 action = policy.predict_action(batch)["action"][0].cpu().numpy()
             absolute = get_real_umi_action(action, raw, action_pose_repr=act_repr)
+            if teacher:
+                gt_gap = float(cam.state(cam.last)["robot0_gripper_width"][0])
+                pred_gap = float(np.clip(absolute[1][6], 0.0, 0.09))
+                gap_track.append((cam.last, gt_gap * 1000, pred_gap * 1000))
 
             for target in absolute[1:1 + a.action_steps]:
                 T_now = fk(q_cur)
@@ -467,8 +497,25 @@ def main() -> None:
                   f"(에피소드 끝까지 안 갔거나, 정책이 안 닫는 것이다)")
     else:
         print("!! 명령이 하나도 안 나갔다. IK 가 전부 거부됐거나 프레임이 없다")
+    if gap_track:
+        rows = [r for r, _, _ in gap_track]
+        gt = np.array([g for _, g, _ in gap_track])
+        pr = np.array([p for _, _, p in gap_track])
+        print(f"\n=== 교사강제 gap 궤적 · {len(gap_track)} 관측 (행 {rows[0]}~{rows[-1]}) ===")
+        print(f"  기록 {gt.min():.1f} ~ {gt.max():.1f} mm   (닫힘폭 {gt.max()-gt.min():.1f})")
+        print(f"  예측 {pr.min():.1f} ~ {pr.max():.1f} mm   (닫힘폭 {pr.max()-pr.min():.1f})")
+        print(f"  절대오차 중앙 {np.median(np.abs(pr-gt)):.2f} mm  최대 {np.abs(pr-gt).max():.2f} mm")
+        obj = 41.0
+        closes = pr.min() <= obj + 10
+        print(f"  판정: 정책이 물체 폭 {obj:.0f}mm 근처까지 닫는가 → "
+              f"{'닫는다' if closes else '**안 닫는다**'}")
+        if gt.max() - gt.min() < 5:
+            print("  ⚠️ 기록 자체의 닫힘폭이 5mm 미만이다. 이 편으로는 판정하지 마라")
+        print("  " + "  ".join(f"{r}:{g:.0f}/{p:.0f}" for r, g, p in gap_track[:12]))
+        print("  (행:기록/예측 mm)")
     if a.out:
-        Path(a.out).write_text(json.dumps(log, indent=1), encoding="utf-8")
+        Path(a.out).write_text(json.dumps(
+            {"log": log, "gap_track": gap_track}, indent=1), encoding="utf-8")
         print(f"→ {a.out}")
 
 
