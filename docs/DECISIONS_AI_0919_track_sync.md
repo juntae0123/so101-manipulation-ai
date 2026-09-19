@@ -155,3 +155,70 @@ T_base_tcp_current = 현재 JointState + so101_ver1.urdf FK
 - 케이스로 시뮬 전문가 코드를 새로 써야 할 필요가 생기고, warm start 이득이
   그 비용을 넘는다는 측정이 나오면 재검토
 - HW·PM 이 다른 대상물을 요구하면 그때 치수·무게를 받아 다시 정한다
+
+---
+
+## D-AI-71 · BE 계약 정렬 완료 — `origin/be` 에서 확인
+
+**작성자**: 김준태(트랙 B) · **근거**: `origin/be` 트리 직접 확인 🟢 (dev 미반영 상태)
+**상태**: D-AI-61 의 1~4·6번 **해소**
+
+### 확인한 커밋·파일
+```
+da9f07e  refactor: 학습 프로필 의존 제거 및 EEF 액션 계약 반영
+d8b01f0  feat: Gripper 채널 정합성 검증 강화
+V4__remove_training_profiles_and_add_eef_action_contract.sql
+V5__add_skill_version_runtime_spec.sql
+ActionSpace.java · checkpoint_manifest.py · EpisodeArchiveValidator.java
+```
+
+### 우리 규약과 대조 — 전부 일치 🟢
+```
+actionSpace   EEF_RELATIVE_ROT6D           enum + DB CHECK 제약
+dim 10 · horizon 8 · rateHz 10
+layout        dx,dy,dz,r00,r01,r02,r10,r11,r12,gap_m
+rotation      ROTATION_MATRIX_ROWS_0_1     ← 행. 열이었으면 4mm 가 조용히 남는다
+compose       T_next = T_cur @ A_relative
+gapUnit m · gapRange [0, 0.09]
+execSlice     {startInclusive:1, endExclusive:5} · execSliceAppliesTo "converted"
+actionPointRateHz 10 · reobserveRateHz 2.5
+gripper 검증  헤더 순서 · status D/X · detected/total/longestX 패스스루 ·
+              INVALID_GRIPPER_CHANNEL
+```
+
+### 무효가 된 우리 요청
+| D-AI-61 | 상태 |
+|---|---|
+| 1 profileKey/algorithm 문자열 확정 | **무효.** `training_profiles` DROP. algorithm/profile 은 trainer 소유, EC2 는 actionSpec 을 opaque 로 보관 |
+| 2 actionSpace 추가 | **해소** |
+| 3 obsDownSampleSteps 프로필 분리 | **무효.** 프로필 제거로 함께 사라짐 |
+| 4 controlRateHz 의미 확정 | **해소.** 둘로 나눠 적었다 |
+| 6 gripper 구조검증 | **해소** |
+
+### 오늘 낸 제안 하나를 철회한다
+**`source_contract` 필드 추가 — 철회.** `runtimeSpec.execSlice` 로 이미 구분된다.
+v10 직접 출력을 쓸 일이 생기면 `{0, 4}` 를 주면 되고 계약에 자리가 있다.
+필드를 새로 파지 않는다. (어댑터 쪽 `--source-contract` 는 우리 내부 구분용으로 유지)
+
+### 우리가 채워 보낸 값
+```
+MODEL_PARAMETER_COUNT      19078252              실측 🟢 (기본값 1)
+MODEL_FRAMEWORK_VERSION    torch 2.13.0+cu126    (기본값 "integration-pending")
+MODEL_CAMERA_NAMES_JSON    ["camera0_rgb"]       (기본값 ["front"])
+MODEL_INPUT_SCHEMA_JSON    {"stateShape":[10]}   (기본값 [6])
+MODEL_OUTPUT_SCHEMA_JSON   {"actionShape":[8,10]} (기본값 [6])
+```
+stateShape 10 의 내역: eef_pos 3 + rot_axis_angle 3 + rot_axis_angle_wrt_start 3
++ gripper_width 1. 서버 롤아웃 로그 `policy_input_keys` 에서 확인 🟢
+
+`contractVersion "umi-policy-v1"` 은 그대로 두되, Jetson 추론 코드와 같은 문자열을
+쓰는지 붙일 때 대조한다.
+
+### ⚠️ 내 오류 — dev 만 보고 "미해결" 로 보고했다
+오늘 팀 브리핑에 BE 항목을 🟠 미해결로 올렸다. **`origin/be` 에는 이미 들어가 있었다.**
+dev 미반영이라 못 봤다. 상대 트랙 상태를 볼 때 **dev 만 보지 않고 해당 브랜치를
+먼저 본다.** 브리핑 정정함.
+
+### 되돌릴 조건
+- be 가 dev 에 머지되면서 내용이 바뀌면 다시 대조한다
+- Jetson 추론 코드가 붙으면 `contractVersion` 과 `frameworkVersion` 을 재확인한다
