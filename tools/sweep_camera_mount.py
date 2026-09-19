@@ -67,6 +67,19 @@ SWEEP_CFG = "configs/_sweep_camera"
 SWEEP_OUT = "outputs/sweep_camera"
 
 
+# ⚠️ 2026-09-19 정정 — 초판 잡 파일에 `MUJOCO_GL=egl` 이 없었다. 서버에 DISPLAY 가
+#    없으므로 렌더러가 즉시 죽고 5개 GPU 잡이 전부 exit 1 났다. evaluate.py 의
+#    **인자**만 소스로 대조하고 **환경변수**는 안 봤다. 기존 러너 8종이 전부
+#    이 줄을 갖고 있었다 (run_e1_train.sh:61 · run_e2.sh:22 · run_e2_folds.sh:82 …).
+JOB_HEADER = """set -eu
+export MUJOCO_GL=egl
+cd {handoff}
+# 렌더링이 되는지 먼저 확인한다. 20편 돌린 뒤에 죽는 것보다 여기서 죽는 게 싸다.
+python -c "import os,sys; sys.exit(0 if os.environ.get('MUJOCO_GL')=='egl' else 1)" \\
+  || {{ echo '!! MUJOCO_GL 이 egl 이 아니다'; exit 2; }}
+"""
+
+
 def rx(deg: float) -> np.ndarray:
     """Rotation about x as 4x4. x축 회전 4x4."""
     c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
@@ -170,6 +183,12 @@ def selftest() -> int:
     check("판별 조건이 들어 있다", "DISC" in names)
     check("판별 조건을 뺄 수 있다", len(conditions(False)) == 13)
     check("GPU 는 허용된 것만", set(GPUS) == {1, 2, 3, 4, 6})
+    hdr = JOB_HEADER.format(handoff="/x")
+    check("잡 헤더에 MUJOCO_GL=egl 이 있다 (정답 아는 행)",
+          "export MUJOCO_GL=egl" in hdr)
+    check("판별력: 헤더에서 그 줄을 빼면 검사가 걸린다",
+          "export MUJOCO_GL=egl" not in hdr.replace("export MUJOCO_GL=egl", ""))
+    check("잡 헤더가 handoff 경로로 cd 한다", "cd /x" in hdr)
 
     print(f"자체검증 {ok} / {tot}")
     return 0 if ok == tot else 1
@@ -193,7 +212,7 @@ def cmd_plan(a) -> int:
 
     for g, lines in jobs.items():
         f = out_root / f"jobs_gpu{g}.sh"
-        f.write_text("set -eu\ncd " + str(handoff) + "\n" + "\n".join(lines)
+        f.write_text(JOB_HEADER.format(handoff=handoff) + "\n".join(lines)
                      + f"\necho SWEEPCAM_GPU{g}_DONE\n", encoding="utf-8")
         print(f"GPU {g}: {len(lines)}개 조건 → {f}")
 
