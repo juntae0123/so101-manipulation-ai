@@ -81,8 +81,30 @@ def count_params(state: dict) -> int:
     return n
 
 
+def plain(v):
+    """Coerce OmegaConf / exotic containers to plain JSON-safe Python.
+    OmegaConf 등 특수 컨테이너를 JSON 으로 나갈 수 있는 순수 파이썬으로 바꾼다.
+
+    ⚠️ 2026-09-19: cfg 값이 `ListConfig` 라 `json.dumps` 가 죽었다. 자체검증이
+    직렬화를 한 번도 시도하지 않아 못 잡았다. 그 행을 추가했다."""
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    try:
+        from omegaconf import OmegaConf
+        if OmegaConf.is_config(v):
+            return OmegaConf.to_container(v, resolve=True)
+    except ImportError:
+        pass
+    if hasattr(v, "items"):
+        return {str(k): plain(x) for k, x in v.items()}
+    if hasattr(v, "__iter__"):
+        return [plain(x) for x in v]
+    return str(v)
+
+
 def at(node, path: str, default=None):
-    """Read one EXPLICIT dotted path. 점 경로 하나를 명시적으로 읽는다.
+    """Read one EXPLICIT dotted path, returning JSON-safe Python.
+    점 경로 하나를 명시적으로 읽어 JSON 안전한 값으로 돌려준다.
 
     ⚠️ 2026-09-19: 초판은 키 이름을 재귀 탐색했다. cfg 안에 `horizon` 이 수십 번 나오고
     (obs 는 2, action 은 8) **먼저 찾히는 것**을 집었다. 8 이 나온 건 운이다.
@@ -95,7 +117,7 @@ def at(node, path: str, default=None):
             cur = cur[part]
         except Exception:                              # noqa: BLE001
             return default
-    return cur
+    return plain(cur)
 
 
 def obs_history(cfg) -> tuple[object, str]:
@@ -158,8 +180,7 @@ def build_manifest(cfg, n_params: int, src: Path, out: Path,
             "obs_history_steps": n_obs,
             "obs_history_source": ("shape_meta.obs.<key>.horizon — `n_obs_steps` 라는 키는 "
                                    f"이 체크포인트에 없다. 집계: {n_obs_detail}"),
-            "obs_keys": sorted(at(cfg, "shape_meta.obs").keys())
-                        if hasattr(at(cfg, "shape_meta.obs"), "keys") else None,
+            "obs_keys": sorted((at(cfg, "shape_meta.obs") or {}).keys()) or None,
             "img_obs_horizon": at(cfg, "task.img_obs_horizon"),
             "low_dim_obs_horizon": at(cfg, "task.low_dim_obs_horizon"),
             "obs_down_sample_steps": at(cfg, "task.obs_down_sample_steps"),
@@ -320,6 +341,37 @@ def selftest() -> int:
     check("obs horizon 불일치 -> None + 사유",
           m2["runtimeSpec"]["obs_history_steps"] is None
           and "갈린다" in m2["runtimeSpec"]["obs_history_source"])
+
+    # 직렬화 — 이게 없어서 ListConfig 를 못 잡았다
+    class FakeSeq:                                     # list 를 상속하지 않는 시퀀스
+        def __init__(self, *v):
+            self._v = list(v)
+        def __iter__(self):
+            return iter(self._v)
+        def __len__(self):
+            return len(self._v)
+        def __getitem__(self, i):
+            return self._v[i]
+
+    exotic = {k: v for k, v in cfg.items()}
+    exotic["policy"] = {"num_inference_steps": 16,
+                        "obs_encoder": {"model_name": "resnet18",
+                                        "shape_meta": {"action": {"shape": FakeSeq(10),
+                                                                  "rotation_rep": "rotation_6d"}}}}
+    m4 = build_manifest(exotic, 0, Path("/x"), Path("/y"), "", None)
+    check("특수 시퀀스 -> 순수 list", m4["actionSpec"]["dim"] == [10], str(m4["actionSpec"]["dim"]))
+    try:
+        json.dumps(m4, ensure_ascii=False)
+        ser = True
+    except TypeError:
+        ser = False
+    check("manifest 가 json.dumps 된다", ser)
+    try:
+        json.dumps({"x": FakeSeq(1)})
+        disc = False
+    except TypeError:
+        disc = True
+    check("판별력: 변환 안 하면 json 이 죽는다", disc)
 
     m3 = build_manifest({}, 0, Path("/x"), Path("/y"), "", None)
     check("빈 cfg -> 전부 None",
