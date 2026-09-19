@@ -214,7 +214,12 @@ def check_episode(env, chain: np.ndarray, T_base_home: np.ndarray, limits: dict,
 
     vbud = np.asarray(limits["joint_speed_rad_s"], dtype=np.float64)
     abud = np.asarray(limits["joint_accel_rad_s2"], dtype=np.float64)
-    lo, hi = env.limits[:, 0], env.limits[:, 1]
+    # ⚠️ 2026-09-19 수정 — 이 두 줄이 아래 `lo, hi = span ...` 에 **덮어써지고 있었다.**
+    #    그 결과 관절 한계 검사가 `q < 구간인덱스` 를 비교했고, 관절각(rad)은 거의 항상
+    #    그 정수보다 작아서 **전부 joint_limit 으로 거부**됐다.
+    #    0917 MEASURE §7 에 결함 #11 로 적혀 있었으나 **수정이 저장소에 들어오지 않았다.**
+    #    이름을 분리한다. 같은 이름을 두 뜻으로 쓰지 않는다.
+    q_lo, q_hi = env.limits[:, 0], env.limits[:, 1]
 
     qs, reasons, residuals = [], [], []
     seed = env.home_q.copy()
@@ -237,7 +242,7 @@ def check_episode(env, chain: np.ndarray, T_base_home: np.ndarray, limits: dict,
             e_pos = float(np.linalg.norm(Tc[:3, 3] - pos))
             e_rot = geodesic_deg(R, Tc[:3, :3])
             residuals.append((e_pos, e_rot))
-            if np.any(q < lo - 1e-6) or np.any(q > hi + 1e-6):
+            if np.any(q < q_lo - 1e-6) or np.any(q > q_hi + 1e-6):
                 why = "joint_limit"
             elif e_pos > ik_tol:
                 why = f"position_residual>{ik_tol}"
@@ -354,6 +359,25 @@ def selftest() -> int:
     caught = cb["position_max_mm"] > 40.0
     print(f"[4] 고의 손상 감지 위치최대 {cb['position_max_mm']:.3f}mm", end="  ")
     print("OK" if caught else "!! 실패 — 망가진 데이터를 못 잡는다"); bad += not caught
+
+    # [N] 이름 충돌 재발 방지 (2026-09-19). 관절 한계와 구간 인덱스가 같은 이름을
+
+    #     쓰면 검사가 조용히 무력화된다. 소스에서 직접 확인한다.
+
+    src = Path(__file__).read_text(encoding="utf-8")
+
+    body = src[src.index("def check_episode("):src.index("# \u2500\u2500 \uc790\uccb4 \uac80\uc99d")]
+
+    bad = ("lo, hi = env.limits" in body) and ("lo, hi = span" in body)
+
+    print(f"[{'!!' if bad else 'OK'}] 관절한계·구간인덱스 이름 분리 "
+
+          f"(q_lo/q_hi {'있음' if 'q_lo' in body else '없음'})")
+
+    if bad:
+
+        raise SystemExit("!! 관절 한계 변수가 구간 인덱스에 덮어써진다. 수치를 내지 않는다")
+
 
     print(f"\n자체검증 {'통과' if bad == 0 else f'실패 {bad}건'}")
     return 1 if bad else 0

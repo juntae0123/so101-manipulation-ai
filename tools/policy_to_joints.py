@@ -275,38 +275,48 @@ def probe_jaw_axis(env) -> dict:
 
 
 def jaw_gate(probe: dict, requested_deg: float) -> float:
-    """Decide the jaw correction from the measurement and refuse double correction.
-    보정값을 계측으로 정하고, 이중 보정을 거부한다.
+    """Compare the model's jaw axis with the target pose's jaw axis. Never guess.
+    모델의 턱 축과 목표 자세의 턱 축을 대조한다. 추측하지 않는다.
 
-    돌려주는 값이 실제로 적용할 각이다. 사용자가 지정한 값이 계측과 어긋나면 죽는다."""
-    a = probe["angle_from_tcp_x_deg"]
+    ⚠️ 2026-09-19 전면 수정 — 초판이 위험했다
+    ------------------------------------------
+    초판은 *"TCP +X 와 0도면 레거시 프레임이니 92.789도를 넣어라"* 로 판정했다.
+    **그 매핑에 근거가 없었다.** 92.79도는 `grasp_so101_ver1.yaml` 이 **gripper body
+    로컬 프레임**에서 잰 값이고, 내가 재는 것은 **TCP site 프레임**이다. 다른 프레임이다.
+
+    서버 실측(2026-09-19): `site_owner_body = gripper_tcp` · jaw 축이 TCP 프레임에서
+    정확히 `[1, 0, 0]` — 즉 **TCP 의 x축이 곧 턱 방향**이다. 그리고 목표 자세
+    (`sim_grasp_pose`)의 x축도 접근축에 수직인 수평 방향, 곧 턱 방향이다.
+    **둘이 같은 뜻의 축이므로 추가 회전은 0도다** (황도경 회신과 일치).
+
+    초판 규칙대로였다면 여기서 92.789도를 넣어 **정확히 이중 보정**이 됐다.
+    막으라고 받은 지적이 만들어낸 바로 그 사고를 내 게이트가 낼 뻔했다.
+
+    지금 규칙: 턱 축이 TCP 의 **어느 축과 정렬돼 있는지**만 확인한다.
+    x 축이면 목표 자세와 같은 규약이므로 보정 0. 아니면 규약이 어긋난 것이므로
+    **보정값을 지어내지 않고 죽는다.** 실제 자세 오차는 solve_waypoints 의
+    측지각 검사(`--jaw-tol-deg`)가 웨이포인트마다 따로 잡는다.
+    """
+    a_x = probe["angle_from_tcp_x_deg"]
     tol = probe["tolerance_deg"]
     print(f"[jaw] 관절 {probe['joint']} (그리퍼 slide {probe['n_gripper_slide_joints']} / "
           f"전체 관절 {probe['n_joints']})")
     print(f"      jaw 축(TCP 프레임) {np.round(probe['jaw_axis_in_tcp'], 6)}  "
-          f"TCP +X 와 {a:.3f}도")
+          f"TCP +X 와 {a_x:.3f}도 · 가장 가까운 축 {probe.get('jaw_nearest_tcp_axis')}")
 
-    if a <= tol:
-        need = JAW_LEGACY_OFFSET_DEG
-        why = (f"jaw 축이 TCP +X 와 {a:.2f}도 — **레거시 +X 프레임**이다. "
-               f"{JAW_LEGACY_OFFSET_DEG}도를 한 번 넣어야 한다")
-    elif abs(a - JAW_LEGACY_OFFSET_DEG) <= tol:
-        need = 0.0
-        why = (f"jaw 축이 TCP +X 와 {a:.2f}도 — **ver1 프레임**이다. "
-               "이미 반영돼 있으므로 추가 회전 0도")
-    else:
+    if a_x > tol:
         raise SystemExit(
-            f"!! jaw 축이 TCP +X 와 {a:.2f}도다. 레거시(0도)도 ver1"
-            f"({JAW_LEGACY_OFFSET_DEG}도)도 아니다 (허용 ±{tol}도).\n"
-            "   보정값을 추측하지 않는다. 모델·계약을 먼저 확인하라.")
+            f"!! 턱 축이 TCP +X 와 {a_x:.2f}도다 (허용 ±{tol}도).\n"
+            "   목표 자세(sim_grasp_pose)의 x축은 턱 방향이다. 규약이 어긋났다.\n"
+            "   보정값을 지어내지 않는다. 모델·계약을 먼저 확인하라.")
 
-    print(f"      → {why}")
+    need = 0.0
+    print(f"      → TCP x축 = 턱 방향. 목표 자세와 같은 규약이므로 추가 회전 {need}도")
     if abs(requested_deg - need) > 1e-9:
         raise SystemExit(
             f"!! --jaw-offset-deg {requested_deg} 는 계측과 어긋난다. 필요한 값은 "
             f"{need} 도다.\n"
-            "   이중 보정하면 90도 넘게 틀어지고, 파지 여유 ±25mm 로는 확정적으로 빗나간다.\n"
-            f"   맞다고 확신하면 --jaw-offset-deg {need} 로 명시하라.")
+            "   이중 보정하면 90도 넘게 틀어지고, 파지 여유 ±25mm 로는 확정적으로 빗나간다.")
     return need
 
 
@@ -619,29 +629,24 @@ def selftest() -> int:
         b_ok = False
     check("허용치 1.9mm 통과 / 2.1mm 거부 (판별력)", a_ok and not b_ok)
 
-    # [16~20] jaw 게이트 — 이중 보정을 막는 것이 요점이다 (황도경 2026-09-19)
+    # [16~19] jaw 게이트 — 이중 보정 차단이 요점 (황도경 2026-09-19 · 서버 실측 반영)
     ver1_jaw = {"joint": "gripper_right", "n_gripper_slide_joints": 2, "n_joints": 8,
-                "jaw_axis_in_tcp": [0.0, 1.0, 0.0],
-                "angle_from_tcp_x_deg": 90.0, "tolerance_deg": JAW_MATCH_TOL_DEG}
-    legacy_jaw = dict(ver1_jaw, jaw_axis_in_tcp=[1.0, 0.0, 0.0],
-                      angle_from_tcp_x_deg=0.0)
-
-    check("ver1 jaw 프레임 -> 추가 회전 0도 (정답 아는 행)",
+                "jaw_axis_in_tcp": [1.0, 0.0, 0.0], "jaw_nearest_tcp_axis": "x",
+                "angle_from_tcp_x_deg": 0.0, "tolerance_deg": JAW_MATCH_TOL_DEG}
+    check("TCP x축 = 턱 방향이면 추가 회전 0도 (서버 실측 형태, 정답 아는 행)",
           jaw_gate(ver1_jaw, 0.0) == 0.0)
-    check("레거시 jaw 프레임 -> 92.789도 필요",
-          jaw_gate(legacy_jaw, JAW_LEGACY_OFFSET_DEG) == JAW_LEGACY_OFFSET_DEG)
     try:
         jaw_gate(ver1_jaw, JAW_LEGACY_OFFSET_DEG)
         caught = False
     except SystemExit:
         caught = True
-    check("판별력: ver1 인데 92.79도를 넣으면 거부 (이중 보정 차단)", caught)
+    check("판별력: 92.79도를 넣으면 거부 (이중 보정 차단)", caught)
     try:
         jaw_gate(dict(ver1_jaw, angle_from_tcp_x_deg=45.0), 0.0)
         caught2 = False
     except SystemExit:
         caught2 = True
-    check("판별력: 둘 다 아닌 각(45도)이면 추측하지 않고 죽는다", caught2)
+    check("판별력: 축이 어긋나면 보정값을 지어내지 않고 죽는다", caught2)
     check("source_contract 두 경로의 실행 구간이 다르다",
           SOURCE_CONTRACTS["official_umi"] == (1, 5)
           and SOURCE_CONTRACTS["v10_direct"] == (0, 4))
