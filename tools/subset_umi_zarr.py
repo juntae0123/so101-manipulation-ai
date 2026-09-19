@@ -68,8 +68,45 @@ def selftest() -> int:
     print(f"[5] 마지막 경계 == 행 수 → {int(new[-1])} vs {rows}  ", end="")
     print("OK" if ok else "!! 실패 — 경계와 행 수가 어긋난다"); bad += (not ok)
 
+    # [6] 실제 .zarr.zip 왕복 — 이게 없어서 "zip 을 안 닫는다"를 못 잡았다.
+    #     순수 계산만 검증하면 저장 경로의 결함은 통과한다.
+    try:
+        import tempfile, zarr, os
+        with tempfile.TemporaryDirectory() as td:
+            dst = os.path.join(td, "t.zarr.zip")
+            g, store = _open_dst(dst)
+            try:
+                g.create_group("data").create_dataset("x", data=np.arange(6))
+                g.create_group("meta").create_dataset(
+                    "episode_ends", data=np.array([3, 6], dtype=np.int64))
+            finally:
+                if store is not None:
+                    store.close()
+            z = zarr.open(dst, mode="r")          # 닫힌 뒤 **새로** 연다
+            ok = (list(z["data"]["x"][:]) == [0, 1, 2, 3, 4, 5]
+                  and list(z["meta"]["episode_ends"][:]) == [3, 6])
+        print(f"[6] .zarr.zip 쓰고 새로 읽기  ", end="")
+        print("OK" if ok else "!! 실패 — zip 이 확정되지 않았다"); bad += (not ok)
+    except ImportError:
+        print("[6] .zarr.zip 왕복  **미실행** (zarr 없음). 통과로 세지 않는다"); bad += 1
+
     print(f"\n자체검증 {'통과' if bad == 0 else f'실패 {bad}건'}")
     return 1 if bad else 0
+
+
+def _open_dst(path: str):
+    """Open the destination, returning (group, store_to_close).
+    출력 대상을 연다. zip 이면 **닫아야 할 store 를 같이** 돌려준다.
+
+    ⚠️ 2026-09-19: `zarr.open(path, mode="w")` 로 `.zarr.zip` 을 쓰면 store 가
+    닫히지 않아 중앙 디렉터리가 안 써진다. 되읽을 때 `BadZipFile` 이 난다.
+    디렉터리 zarr 로만 써봐서 여기까지 안 왔었다."""
+    import zarr
+    if str(path).endswith(".zip"):
+        store = zarr.ZipStore(path, mode="w")
+        # overwrite=True 는 rmdir 을 부르는데 ZipStore 가 제대로 못 한다. 새 파일이라 불필요
+        return zarr.group(store=store), store
+    return zarr.open(path, mode="w"), None
 
 
 # ── 실행 ─────────────────────────────────────────────────────────────────
@@ -98,36 +135,33 @@ def main() -> None:
     print(f"원본 편 {len(ee)} · 총 행 {int(ee[-1]) if len(ee) else 0}")
     print(f"자를 편 {len(new_ee)} · 행 {rows}  ({rows/int(ee[-1])*100:.1f}%)" if len(ee) else "")
 
-    dst = zarr.open(a.dst, mode="w")
-    dg, sg = dst.create_group("data"), src["data"]
-    keys = sorted(sg.array_keys())
-    print(f"\n배열 {len(keys)}개 복사")
-    for k in keys:
-        arr = sg[k]
-        out = np.asarray(arr[:rows])
-        dg.create_dataset(k, data=out, chunks=arr.chunks, dtype=arr.dtype)
-        print(f"  {k:32s} {arr.shape} → {out.shape}")
-    mg = dst.create_group("meta")
-    mg.create_dataset("episode_ends", data=new_ee, dtype=new_ee.dtype)
+    dst, store = _open_dst(a.dst)
+    try:
+        dg, sg = dst.create_group("data"), src["data"]
+        keys = sorted(sg.array_keys())
+        print(f"\n배열 {len(keys)}개 복사")
+        for k in keys:
+            arr = sg[k]
+            out = np.asarray(arr[:rows])
+            dg.create_dataset(k, data=out, chunks=arr.chunks, dtype=arr.dtype)
+            print(f"  {k:32s} {arr.shape} → {out.shape}")
+        mg = dst.create_group("meta")
+        mg.create_dataset("episode_ends", data=new_ee, dtype=new_ee.dtype)
+    finally:
+        if store is not None:
+            store.close()          # ← 닫아야 zip 이 확정된다
+            print("\nZipStore 닫음")
 
-    # 검산 — 쓰고 나서 다시 읽는다. "썼다"와 "맞게 썼다"는 다르다
+    # 검산 — **닫은 뒤 새로 연다.** 같은 핸들로 확인하면 확정 여부를 못 본다
+    import zarr
     chk = zarr.open(a.dst, mode="r")
     cee = np.asarray(chk["meta"]["episode_ends"][:])
-    bad = []
-    for k in keys:
-        n = chk["data"][k].shape[0]
-        if n != rows:
-            bad.append(f"{k} 행 {n} != {rows}")
-    if len(cee) != len(new_ee) or (len(cee) and int(cee[-1]) != rows):
-        bad.append(f"episode_ends 마지막 {int(cee[-1]) if len(cee) else None} != 행 {rows}")
-    print(f"\n검산 — 배열 {len(keys)}개 · 편 {len(cee)} · 행 {rows}")
-    if bad:
-        for b in bad:
-            print(f"  !! {b}")
-        raise SystemExit("!! 검산 실패. 이 zarr 를 쓰지 마라")
-    gw = np.asarray(chk["data"]["robot0_gripper_width"][:]).ravel()
-    print(f"  전부 일치. gap 중앙 {np.median(gw)*1000:.2f} mm (원본 전체와 비교해 보라)")
-    print(f"\n→ {a.dst}")
+    shapes = {k: chk["data"][k].shape[0] for k in sorted(chk["data"].array_keys())}
+    uniq = sorted(set(shapes.values()))
+    ok = (len(cee) == len(new_ee)) and (len(uniq) == 1) and (uniq[0] == int(cee[-1]))
+    print(f"\n되읽기 검산  편 {len(cee)}/{len(new_ee)} · 배열 {len(shapes)}개 행 {uniq} · "
+          f"마지막경계 {int(cee[-1])}  {'OK' if ok else '!! 경계와 행 수가 어긋난다'}")
+    raise SystemExit(0 if ok else 1)
 
 
 if __name__ == "__main__":
