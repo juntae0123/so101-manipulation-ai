@@ -99,6 +99,46 @@ def stage0(ckpt_path: Path, man: dict | None) -> tuple[int, int, dict]:
     return ok, total, {"cfg": cfg, "payload": p, "obs_names": names}
 
 
+def _prepare_umi_path(umi_root: str | None) -> str:
+    """Put the official UMI package on sys.path, reporting which route worked.
+    공식 UMI 패키지를 sys.path 에 올리고 **어느 경로로 됐는지** 보고한다.
+
+    `diffusion_policy` 는 UMI 저장소 안에 있다. 경로가 안 잡히면 hydra 가
+    'Error locating target' 로 죽는데, 그건 체크포인트 문제가 아니라 환경 문제다.
+    둘을 구분해서 찍는다."""
+    import importlib
+    import os
+
+    if importlib.util.find_spec("diffusion_policy") is not None:
+        return "UMI 경로: 이미 import 가능"
+
+    tried = []
+    if umi_root:
+        tried.append(Path(umi_root).expanduser())
+    tried += [Path.cwd() / "third_party/umi",
+              Path.cwd().parent / "third_party/umi",
+              Path.home() / "handoff/third_party/umi"]
+
+    try:
+        from umi_adapter.upstream import enable
+        enable()
+        if importlib.util.find_spec("diffusion_policy") is not None:
+            return "UMI 경로: umi_adapter.upstream.enable()"
+    except Exception:                                  # noqa: BLE001
+        pass
+
+    for cand in tried:
+        if (cand / "diffusion_policy").is_dir():
+            sys.path.insert(0, str(cand))
+            importlib.invalidate_caches()
+            if importlib.util.find_spec("diffusion_policy") is not None:
+                return f"UMI 경로: sys.path += {cand}"
+    raise ImportError(
+        f"diffusion_policy 를 못 찾았다. 시도한 곳 {len(tried)}군데: "
+        f"{[str(t) for t in tried]}. --umi-root 로 UMI 저장소 경로를 주거나, "
+        "공식 UMI 를 설치한 환경에서 돌려라. **체크포인트 문제가 아니라 환경 문제다.**")
+
+
 def stage1(ctx: dict) -> tuple[int, int]:
     """One real forward pass with synthetic observations. 합성 관측으로 실제 추론 1회."""
     import numpy as np
@@ -111,6 +151,7 @@ def stage1(ctx: dict) -> tuple[int, int]:
         ok += bool(cond)
         print(f"  [{total}] {name:<42} {'OK' if cond else '!! 실패'}  {detail}")
 
+    print(f"  {_prepare_umi_path(ctx.get('umi_root'))}")
     import hydra
     cfg = ctx["cfg"]
     policy = hydra.utils.instantiate(cfg.policy)
@@ -181,6 +222,7 @@ def main() -> None:
     ap.add_argument("--checkpoint")
     ap.add_argument("--manifest")
     ap.add_argument("--skip-stage1", action="store_true")
+    ap.add_argument("--umi-root", help="공식 UMI 저장소 경로 (diffusion_policy 의 부모)")
     a = ap.parse_args()
     if a.selftest:
         sys.exit(selftest())
@@ -190,6 +232,7 @@ def main() -> None:
     man = json.loads(Path(a.manifest).read_text(encoding="utf-8")) if a.manifest else None
     print("=== 단계 0 · 파일 온전성과 계약 대조 (torch 만 필요) ===")
     o0, t0, ctx = stage0(Path(a.checkpoint).expanduser(), man)
+    ctx["umi_root"] = a.umi_root
     print(f"  단계 0: {o0} / {t0}")
 
     o1 = t1 = 0
