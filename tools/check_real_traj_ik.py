@@ -318,6 +318,8 @@ def check_episode(env, chain: np.ndarray, T_base_home: np.ndarray, limits: dict,
     n_chunks = max(0, len(ok_way) - horizon)
     ok_chunks = sum(1 for i in range(n_chunks) if all(ok_way[i:i + horizon]))
     fin = [r for r in residuals if not math.isnan(r[0])]
+    _free = [a for a, _ in splits if not math.isnan(a)]
+    _perp = [b for _, b in splits if not math.isnan(b)]
 
     too_short = len(ok_way) < horizon + 1
     return {
@@ -335,10 +337,10 @@ def check_episode(env, chain: np.ndarray, T_base_home: np.ndarray, limits: dict,
         "position_residual_max_mm": round(max((r[0] for r in fin), default=float("nan")) * 1000, 3) if fin else None,
         "rotation_residual_max_deg": round(max((r[1] for r in fin), default=float("nan")), 3) if fin else None,
         # 보고용 분해 (거부 규칙에는 안 쓴다)
-        "rot_free_axis_max_deg": round(max((a for a, b in splits if not math.isnan(a)),
-                                           default=float("nan")), 3) if splits else None,
-        "rot_perp_max_deg": round(max((b for a, b in splits if not math.isnan(b)),
-                                      default=float("nan")), 3) if splits else None,
+        # 빈 목록에 max 를 걸지 않는다. 비었으면 None 이고, 그건 "0도" 와 다른 상태다.
+        "rot_free_axis_max_deg": (round(max(_free), 3) if _free else None),
+        "rot_perp_max_deg": (round(max(_perp), 3) if _perp else None),
+        "rot_split_n": len(_free),
         "rot_split_note": "접근축 둘레 성분은 평행 그리퍼 측면파지에서 자유 축이다. "
                           "거부 판정에는 쓰지 않았다",
         "reasons": reasons,
