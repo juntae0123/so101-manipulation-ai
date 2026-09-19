@@ -227,6 +227,24 @@ def tcp_gate(probe: dict, override: float | None) -> None:
     print("[TCP] ver1 파지점 확인. 통과")
 
 
+# ---------------------------------------------------------------- env 생성
+
+def make_env(PickEnv, task_path: str):
+    """Construct PickEnv against its ACTUAL signature, not a remembered one.
+    기억이 아니라 **실제 시그니처**에 맞춰 PickEnv 를 만든다.
+
+    2026-09-19: `PickEnv(task=...)` 로 불러 TypeError 가 났다. 소스는
+    `(camera_path, object_kind, task_path, task_config)` 다. 인자를 소스로 대조하지
+    않고 쓴 내 잘못이고, 같은 실수를 반복하지 않도록 여기서 검사한다."""
+    import inspect
+    params = list(inspect.signature(PickEnv.__init__).parameters)
+    if "task_path" not in params:
+        raise SystemExit(
+            f"!! PickEnv 가 task_path 를 안 받는다. 실제 인자: {params}\n"
+            "   handoff 버전이 바뀌었다. 소스를 보고 이 호출을 고쳐라.")
+    return PickEnv(task_path=task_path)
+
+
 # ---------------------------------------------------------------- IK
 
 def solve_waypoints(env, poses, seed_q, jaw_offset_deg: float, ik_tol: float):
@@ -447,7 +465,7 @@ def main() -> None:
         ap.error("--task 가 필요하다 (또는 --selftest)")
 
     from simulation.env import PickEnv                      # handoff 패키지
-    env = PickEnv(task=a.task)
+    env = make_env(PickEnv, a.task)
     probe = probe_tcp_offset(env)
 
     if a.probe_tcp:
