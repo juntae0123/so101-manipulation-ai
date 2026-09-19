@@ -27,7 +27,11 @@ R=$HOME/handoff
 PY=$HOME/envs/handoff312/bin/python
 TOOLS=$HOME/S15P21A103/AI/tools
 TAG=domran
-GROUPS=${GROUPS:-10}
+# ⚠️ `GROUPS` 는 bash 내장 변수다 (현재 사용자의 그룹 ID 배열, 읽기 전용).
+#    `GROUPS=${GROUPS:-10}` 은 조용히 무시되고 $GROUPS 가 GID 를 준다 —
+#    2026-09-19 에 1008 이 들어와 10080편을 생성할 뻔했다. env -u 로도 못 막는다.
+#    **셸 예약 이름을 변수로 쓰지 않는다.** N_GROUPS 로 바꿨다.
+N_GROUPS=${N_GROUPS:-10}
 PER=${PER:-10}
 SEED0=${SEED0:-6000}
 EPOCHS=${EPOCHS:-60}
@@ -40,7 +44,7 @@ EVAL_N=${EVAL_N:-20}
 
 cd "$R"
 
-# ⚠️ 2026-09-19 — 셸에 GROUPS 가 이미 있어서 `${GROUPS:-10}` 이 100 을 집었고,
+# ⚠️ 2026-09-19 — 해석된 값을 안 찍어서 잘못된 편수를 눈치채지 못했다.
 #    100편이 아니라 1000편을 생성했다. **해석된 값을 안 찍은 것이 원인**이다.
 #    "모수를 같이 찍는다" 를 스크립트에도 적용한다.
 LOCK=outputs/.${TAG}.lock
@@ -51,14 +55,22 @@ fi
 echo $$ > "$LOCK"
 trap 'rm -f "$LOCK"' EXIT
 
+# 예약 이름을 쓰고 있지 않은지 스스로 검사한다. 값 검사로는 안 잡히는 종류다.
+for v in N_GROUPS PER SEED0 EPOCHS BATCH WORKERS GPU OBJECT; do
+  case "$v" in
+    GROUPS|UID|EUID|PPID|RANDOM|SECONDS|LINENO|HISTCMD|FUNCNAME|PWD|OLDPWD|IFS|SHELL|HOME|PATH|REPLY|OPTARG|OPTIND)
+      echo "!! $v 는 셸 예약 이름이다. 대입이 조용히 무시된다"; exit 7;;
+  esac
+done
+
 echo "== 0. 해석된 설정 =="
-printf '  %-10s %s\n' GROUPS "$GROUPS" PER "$PER" SEED0 "$SEED0" EPOCHS "$EPOCHS" \
+printf '  %-10s %s\n' N_GROUPS "$N_GROUPS" PER "$PER" SEED0 "$SEED0" EPOCHS "$EPOCHS" \
        BATCH "$BATCH" WORKERS "$WORKERS" GPU "$GPU" OBJECT "$OBJECT" \
        EVAL_SEED "$EVAL_SEED" EVAL_N "$EVAL_N"
-echo "  총 생성 편수 $((GROUPS * PER)) · 학습 epoch $EPOCHS"
-if [ "$((GROUPS * PER))" -gt 200 ] && [ "${ALLOW_BIG:-0}" != "1" ]; then
-  echo "!! 총 편수 $((GROUPS * PER)) 는 사전등록(100편)보다 크다."
-  echo "   셸에 GROUPS/PER 가 남아 있지 않은지 확인하라: GROUPS=[$GROUPS] PER=[$PER]"
+echo "  총 생성 편수 $((N_GROUPS * PER)) · 학습 epoch $EPOCHS"
+if [ "$((N_GROUPS * PER))" -gt 200 ] && [ "${ALLOW_BIG:-0}" != "1" ]; then
+  echo "!! 총 편수 $((N_GROUPS * PER)) 는 사전등록(100편)보다 크다."
+  echo "   셸에 N_GROUPS/PER 가 남아 있지 않은지 확인하라: N_GROUPS=[$N_GROUPS] PER=[$PER]"
   echo "   의도한 것이면 ALLOW_BIG=1 을 붙여라."
   exit 8
 fi
@@ -104,15 +116,15 @@ print("정답 아는 행 통과")
 PYEOF
 
 echo
-echo "== 2. 카메라 설정 ${GROUPS}종 생성 =="
-$PY "$TOOLS/make_domran_cameras.py" --handoff "$R" --groups "$GROUPS" \
+echo "== 2. 카메라 설정 ${N_GROUPS}종 생성 =="
+$PY "$TOOLS/make_domran_cameras.py" --handoff "$R" --groups "$N_GROUPS" \
     --episodes-per-group "$PER" --seed0 "$SEED0"
 
 echo
 echo "== 3. 그룹별 시연 생성 =="
 MERGED=outputs/${TAG}_demos
 rm -rf "$MERGED"; mkdir -p "$MERGED"
-for i in $(seq 0 $((GROUPS - 1))); do
+for i in $(seq 0 $((N_GROUPS - 1))); do
   g=g$i
   s=$((SEED0 + i * PER))
   out=outputs/${TAG}_raw_${g}
@@ -123,8 +135,8 @@ for i in $(seq 0 $((GROUPS - 1))); do
   for ep in "$out"/episode_*; do cp -r "$ep" "$MERGED/"; done
 done
 n=$(ls -d "$MERGED"/episode_* 2>/dev/null | wc -l)
-echo "병합 편수 $n / 기대 $((GROUPS * PER))"
-[ "$n" -eq $((GROUPS * PER)) ] || { echo "!! 편수가 안 맞는다. 중단"; exit 3; }
+echo "병합 편수 $n / 기대 $((N_GROUPS * PER))"
+[ "$n" -eq $((N_GROUPS * PER)) ] || { echo "!! 편수가 안 맞는다. 중단"; exit 3; }
 
 echo
 echo "== 4. zarr export =="
