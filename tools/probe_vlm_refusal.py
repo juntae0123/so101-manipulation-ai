@@ -108,6 +108,20 @@ REFUSE_ITEMS: tuple[tuple[str, str], ...] = (
 )
 
 GATE_G2 = 0.60
+ABSTAIN_PERCENTILE = 5.0
+"""A 팔의 임계는 지원 지시 중 **맞힌 항목의 margin 하위 5 퍼센타일**로 정한다.
+거절 집합을 보지 않고 정한다. 실행 전에 박은 값이다 (PREREG 개정판)."""
+
+
+def abstain_threshold(margins_correct: list[float]) -> float:
+    """Threshold from the support set only. 지원 지시 집합에서만 임계를 뽑는다."""
+    if not margins_correct:
+        raise ValueError("맞힌 항목이 0개다. 임계를 정할 수 없다")
+    xs = sorted(margins_correct)
+    k = (ABSTAIN_PERCENTILE / 100.0) * (len(xs) - 1)
+    lo = int(k)
+    hi = min(lo + 1, len(xs) - 1)
+    return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
 
 
 def refusal_question(instruction: str, variant: str = "v1") -> str:
@@ -174,6 +188,17 @@ def selftest() -> int:
     check("묶음별 집계가 모수와 맞는다",
           sc["A"] == {"refused": 1, "total": 2} and sc["B"] == {"refused": 1, "total": 1})
 
+    check("기권 임계: 1~10 의 5퍼센타일 = 1.45 (정답 아는 행)",
+          abs(abstain_threshold([float(i) for i in range(1, 11)]) - 1.45) < 1e-9)
+    try:
+        abstain_threshold([])
+        died = False
+    except ValueError:
+        died = True
+    check("판별력: 맞힌 항목이 0개면 임계를 만들지 않고 죽는다", died)
+    check("판별력: 값이 다르면 임계도 달라진다",
+          abstain_threshold([1.0, 2.0]) != abstain_threshold([5.0, 6.0]))
+
     lo, hi = wilson95(15, 25)
     check("신뢰구간이 점추정을 감싼다", lo < 0.6 < hi, f"[{lo:.3f}, {hi:.3f}]")
     check("게이트 G2 가 0.60 (사전등록값)", abs(GATE_G2 - 0.60) < 1e-12)
@@ -221,7 +246,8 @@ def main() -> int:
     blank = Image.new("RGB", (64, 64), (0, 0, 0))
     print(f"[입력] 텍스트만. 이미지는 검은 {blank.size} 자리표시자다")
 
-    def predict(instruction: str) -> str:
+    def predict(instruction: str) -> tuple[str, float, str]:
+        """Return (B팔 예측, margin, A팔 5종 예측). 한 번 돌려 두 팔을 같이 잰다."""
         question = refusal_question(instruction, a.variant)
         scores = []
         for cand in CANDIDATES:
@@ -242,21 +268,50 @@ def main() -> int:
             lp = torch.log_softmax(logits[0, n_prompt - 1:n_total - 1, :], dim=-1)
             tgt = ids[n_prompt:n_total]
             scores.append(float(lp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1).mean()))
-        return CANDIDATES[max(range(len(scores)), key=lambda i: scores[i])]
+        order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        pred_b = CANDIDATES[order[0]]
+        # A 팔: 거절 후보를 뺀 5종만으로 다시 고르고 1등-2등 차이를 margin 으로 쓴다.
+        five = sorted(range(len(SKILLS)), key=lambda i: scores[i], reverse=True)
+        margin = scores[five[0]] - scores[five[1]]
+        return pred_b, float(margin), SKILLS[five[0]]
 
     items = build_items()
     sup_rows = []
     for i, it in enumerate(items):
-        pred = predict(it.instruction)
-        sup_rows.append({"skill": it.skill, "pred": pred, "hit": pred == it.skill})
+        pb, mg, pa = predict(it.instruction)
+        sup_rows.append({"skill": it.skill, "pred": pb, "hit": pb == it.skill,
+                         "margin": mg, "pred_a": pa, "hit_a": pa == it.skill})
         if (i + 1) % 25 == 0:
             print(f"  지원 지시 {i+1} / {len(items)}")
     ref_rows = []
     for i, (bucket, text) in enumerate(REFUSE_ITEMS):
+        pb, mg, pa = predict(text)
         ref_rows.append({"bucket": bucket, "instruction": text,
-                         "pred": predict(text)})
+                         "pred": pb, "margin": mg, "pred_a": pa})
         if (i + 1) % 10 == 0:
             print(f"  거절 지시 {i+1} / {len(REFUSE_ITEMS)}")
+
+    # ── A 팔: 임계는 지원 지시 중 맞힌 것들의 margin 에서만 뽑는다
+    thr = abstain_threshold([r["margin"] for r in sup_rows if r["hit_a"]])
+    for r in sup_rows:
+        r["abstain"] = r["margin"] < thr
+    for r in ref_rows:
+        r["abstain"] = r["margin"] < thr
+    a_hits = sum(1 for r in sup_rows if r["hit_a"] and not r["abstain"])
+    a_ref = sum(1 for r in ref_rows if r["abstain"])
+    a_acc = a_hits / len(sup_rows)
+    aa_lo, aa_hi = wilson95(a_hits, len(sup_rows))
+    ar_lo, ar_hi = wilson95(a_ref, len(ref_rows))
+    print(f"\n[A 팔 · margin 기권]  임계 {thr:.4f} "
+          f"(맞힌 항목 margin 하위 {ABSTAIN_PERCENTILE:.0f}%)")
+    print(f"  G1 본업 {a_hits} / {len(sup_rows)} = {a_acc:.3f} [{aa_lo:.3f}, {aa_hi:.3f}]"
+          f"  (기권한 지원 지시 {sum(r['abstain'] for r in sup_rows)}건은 오답으로 셌다)")
+    print(f"  G2 거절 {a_ref} / {len(ref_rows)} = {a_ref/len(ref_rows):.3f} "
+          f"[{ar_lo:.3f}, {ar_hi:.3f}]")
+    a_pass = (0.74 <= a_acc <= 0.89 or aa_lo >= 0.74) and a_ref / len(ref_rows) >= GATE_G2
+    print(f"  판정 {'채택' if a_pass else '미채택'}"
+          + ("  → A 로 충분하다. B 는 안 쓴다" if a_pass else ""))
+    print("\n[B 팔 · 거절 후보 추가]")
 
     hits = sum(r["hit"] for r in sup_rows)
     acc = hits / len(sup_rows)
@@ -288,6 +343,14 @@ def main() -> int:
         "_input": "텍스트만. 이미지는 검은 64x64 자리표시자",
         "_limit": "지시문을 어시스턴트가 작성했다. 제품 정확도로 인용 금지",
         "model": a.model, "variant": a.variant, "candidates": list(CANDIDATES),
+        "arm_a_margin_abstain": {
+            "threshold": thr, "percentile": ABSTAIN_PERCENTILE,
+            "threshold_from": "지원 지시 중 맞힌 항목의 margin. 거절 집합 미사용",
+            "support_hits": a_hits, "support_n": len(sup_rows), "support_acc": a_acc,
+            "support_ci": [aa_lo, aa_hi],
+            "support_abstained": sum(r["abstain"] for r in sup_rows),
+            "refuse_refused": a_ref, "refuse_n": len(ref_rows),
+            "refuse_ci": [ar_lo, ar_hi], "verdict": "채택" if a_pass else "미채택"},
         "support": {"hits": hits, "n": len(sup_rows), "acc": acc,
                     "ci": [a_lo, a_hi], "leaked_to_refuse": leak, "rows": sup_rows},
         "refuse": {"refused": refused, "n": len(ref_rows), "rate": rr,
