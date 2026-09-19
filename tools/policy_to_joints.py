@@ -59,6 +59,7 @@ import numpy as np
 
 # 규약 상수 — 바꾸려면 MEASURE 문서와 D- 기록이 먼저다
 ACTION_DIM = 10
+DT_S = 0.1          # 액션 점 간격 [s]. 10Hz 공칭 — v10 원본 간격은 균일하지 않다
 ROT6D_ROWS = True            # 첫 두 "행". 열이 아니다
 GAP_MIN_M, GAP_MAX_M = 0.0, 0.09
 GAP_REJECT_ABOVE_M = 0.15    # 단위 사고 감지: mm 가 들어오면 64.23 등으로 즉시 걸린다
@@ -659,6 +660,17 @@ def selftest() -> int:
     check("손목 시드 후보가 여러 개다 (한 시드면 턱 틀어진 해가 걸린다)",
           len(WRIST_ROLL_SEEDS_RAD) >= 3)
 
+    # [26~28] 재생 출력이 gap 을 같이 싣는가 (황도경 지적 2026-09-19)
+    fake_q = [[0.1, 0.2, 0.3, 0.4, 0.5], [0.11, 0.21, 0.31, 0.41, 0.51]]
+    fake_gap = [0.070, 0.041]
+    rows = [[*q, float(g)] for q, g in zip(fake_q, fake_gap)]
+    check("재생 행이 6열이다 (관절5 + gap)", all(len(r) == 6 for r in rows))
+    check("gap 이 행마다 다르다 (상수 명령이 아니다)",
+          rows[0][5] != rows[1][5], f"{rows[0][5]} vs {rows[1][5]}")
+    check("판별력: q 만 내보내면 5열이라 gap 이 사라진다",
+          len(fake_q[0]) == 5 and 0.041 not in fake_q[0])
+    check("점 간격 상수가 10Hz", abs(DT_S - 0.1) < 1e-12)
+
     print(f"\n자체검증 {ok} / {total}")
     return 0 if ok == total else 1
 
@@ -686,10 +698,13 @@ def main() -> None:
     ap.add_argument("--action", help="(8,10) 액션 청크 .npy 또는 .json")
     ap.add_argument("--from-home", action="store_true", help="T_cur 를 태스크 홈 pose 로")
     ap.add_argument("--from-q", help="현재 관절각 5개 rad, 콤마 구분. T_cur 를 FK 로 구한다")
+    # 기본값을 주지 않는다 (황도경 지적 2026-09-19): 기본값이 있으면 엄밀히는
+    # 필수 입력이 아니고, **안 정한 것과 정한 것이 같은 모양**이 된다.
     ap.add_argument("--source-contract", choices=sorted(SOURCE_CONTRACTS),
-                    default="official_umi",
+                    default=None,
                     help="액션 청크의 출처. 실행 구간이 여기서 정해진다 — "
-                         "official_umi 1..4 / v10_direct 0..3 (황도경 확인 2026-09-19)")
+                         "official_umi 1..4 / v10_direct 0..3 (황도경 확인 2026-09-19). "
+                         "**필수다. 기본값 없다**")
     ap.add_argument("--exec-slice", default=None,
                     help="실행 구간을 직접 지정 (예 1:5). 주면 --source-contract 기본값을 덮는다")
     ap.add_argument("--jaw-offset-deg", type=float, default=0.0,
@@ -708,6 +723,9 @@ def main() -> None:
         sys.exit(selftest())
     if not a.task:
         ap.error("--task 가 필요하다 (또는 --selftest)")
+    if not a.source_contract:
+        ap.error("--source-contract 가 필요하다 (official_umi / v10_direct). "
+                 "기본값을 두지 않는다 — 안 정한 것과 정한 것이 같은 모양이 되면 안 된다")
 
     from simulation.env import PickEnv                      # handoff 패키지
     env = make_env(PickEnv, a.task)
@@ -775,6 +793,9 @@ def main() -> None:
         "ik_tolerance_m": a.ik_tol,
         "waypoints": sol,
         "gripper_m": gaps,
+        "dt_s": DT_S,
+        "waypoint_times_s": [round(i * DT_S, 4) for i in range(len(sol))],
+        "exec_duration_s": round((hi - lo) * DT_S, 4),
         "ik_success": len(good),
         "ik_requested": len(sol),
         "conditions": {
@@ -795,12 +816,20 @@ def main() -> None:
         if len(good) != len(sol):
             raise SystemExit(
                 f"!! IK 가 {len(sol) - len(good)}개 거부됐다. 부분 궤적을 실물에 내보내지 않는다.")
-        Path(a.out_replay).expanduser().write_text(
-            json.dumps([s["q"] for s in good]), encoding="utf-8")
-        print(f"재생용 궤적 -> {a.out_replay}  ({len(good)} 웨이포인트)")
-        print("⚠️ replay_trajectory.py 의 --gripper 는 궤적 전체에 상수 하나다. "
-              f"웨이포인트별 개구는 {[round(g, 4) for g in gaps]} 이고 "
-              "현재 재생 도구는 이를 못 따라간다.")
+        # 웨이포인트별 gap 을 **같은 행에** 싣는다 (황도경 지적 2026-09-19).
+        # q 만 내보내면 재생 쪽에서 상수 그리퍼 명령으로 바뀌고, 그건 관통이 아니다.
+        # replay_trajectory.parse_waypoints 가 [q1..q5, gap_m] 6폭을 받는다.
+        if len(gaps) != len(good):
+            raise SystemExit(
+                f"!! gap {len(gaps)}개 / 웨이포인트 {len(good)}개 — 개수가 다르다. "
+                "행 대응이 깨지면 조용히 어긋난다. 내보내지 않는다")
+        rows = [[*s["q"], float(g)] for s, g in zip(good, gaps)]
+        Path(a.out_replay).expanduser().write_text(json.dumps(rows), encoding="utf-8")
+        print(f"재생용 궤적 -> {a.out_replay}  "
+              f"({len(rows)} 웨이포인트 × 6열 = 관절5 + gap_m)")
+        print(f"  웨이포인트별 개구 {[round(g, 4) for g in gaps]}")
+        print(f"  점 간격 {DT_S:.3f} s (10Hz 공칭) · 실행 구간 {hi - lo}점 "
+              f"= {(hi - lo) * DT_S:.2f} s")
 
 
 if __name__ == "__main__":
