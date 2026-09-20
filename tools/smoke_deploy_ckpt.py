@@ -117,6 +117,8 @@ def stage0(ckpt_path: Path, man: dict | None) -> tuple[int, int, dict]:
               f"{len(exp) - len(bad) - len(both_none)} / {len(exp)}"
               + (f"  불일치 {bad}" if bad else "")
               + (f"  양쪽 모두 None {both_none}" if both_none else ""))
+        _ok, _why = anchor_verdict(man)
+        check("청크 앵커 규약 chunk_start (D-AI-80)", _ok, _why)
     else:
         print("  [--] manifest 미지정 — 계약 대조 **미실행**")
 
@@ -237,6 +239,25 @@ def stage1(ctx: dict) -> tuple[int, int]:
     return ok, total
 
 
+def anchor_verdict(man: dict | None) -> tuple[bool, str]:
+    """Chunk-anchor gate: absence is NOT a pass.
+    청크 앵커 규약 판정 (D-AI-80). 키가 없으면 '대조 불가'이지 통과가 아니다.
+
+    매니페스트의 `compose: "T_next = T_cur @ A_relative"` 문자열은 청크 **안에서**
+    누적하는지 앵커를 고정하는지 말해주지 않는다. 그 모호함으로 so101_infer.unroll 이
+    누적으로 구현됐고 실물이 반경 565mm 원호를 돌았다. 이제 값으로 확인한다.
+    """
+    if not man:
+        return False, "manifest 미지정 — 대조 불가. 통과가 아니다"
+    ca = man.get("actionSpec", {}).get("chunk_anchor")
+    if ca is None:
+        return False, ("키 없음 — D-AI-80 이전 매니페스트다. 앵커/누적을 구분할 수 없다. "
+                       "대조 불가는 통과가 아니다. export_deploy_ckpt 로 다시 뽑아라")
+    if ca != "chunk_start":
+        return False, f"chunk_anchor={ca!r} — 'chunk_start' 여야 한다"
+    return True, "chunk_start"
+
+
 def selftest() -> int:
     """Known-answer rows that do not need the checkpoint. ckpt 없이 도는 정답 아는 행."""
     ok = total = 0
@@ -253,6 +274,15 @@ def selftest() -> int:
                            "obs_down_sample_steps": 1, "num_inference_steps": 16}}
     check("manifest 스키마 읽힘", man["actionSpec"]["horizon"] == 8)
     check("판별력: 불일치가 감지되는가", str(man["actionSpec"]["horizon"]) != str(16))
+
+    # [3-6] 청크 앵커 게이트 (D-AI-80). '없음'과 '괜찮음'이 갈리는지 본다
+    good = {"actionSpec": {"chunk_anchor": "chunk_start"}}
+    check("앵커 chunk_start -> 통과", anchor_verdict(good)[0] is True)
+    check("앵커 키 없음 -> 실패 (판별행)", anchor_verdict(man)[0] is False,
+          anchor_verdict(man)[1][:34])
+    check("앵커 값이 누적 -> 실패 (판별행)",
+          anchor_verdict({"actionSpec": {"chunk_anchor": "accumulate"}})[0] is False)
+    check("manifest 없음 -> 실패 (판별행)", anchor_verdict(None)[0] is False)
     try:
         import torch  # noqa: F401
         t = True

@@ -173,6 +173,16 @@ def build_manifest(cfg, n_params: int, src: Path, out: Path,
             "rotation_rep_cfg": at(cfg, "policy.obs_encoder.shape_meta.action.rotation_rep"),
             "compose": "T_next = T_cur @ A_relative",
             "anchor": "T_cur = 현재 TCP = 패드 사이 중심 (손끝 아님)",
+            # ⚠️ D-AI-80 (2026-09-20) — 위 compose 문자열만으로는 청크 **안에서**
+            #    누적하는지 앵커를 고정하는지 구분할 수 없다. 그 모호함 때문에
+            #    so101_infer.unroll 이 누적으로 구현돼 실물이 원호를 돌았다.
+            #    이제 규약을 문자열이 아니라 값으로 못박는다.
+            "chunk_anchor": "chunk_start",
+            "chunk_anchor_note": (
+                "청크 안의 모든 행은 청크 시작 pose 기준이다. 누적하지 않는다: "
+                "P_k = T_anchor @ A[k]. 앵커는 청크 사이에서만 마지막 실행점(실물에서는 "
+                "재관측 pose)으로 넘어간다. 근거 v10 20편·비교 5648건 — 앵커 오차 중앙·"
+                "최대 0.0000mm, 누적 59.7291mm (MEASURE_chunk_anchor_0920)"),
             "gapUnit": "m",
             "gapRange": [0.0, 0.09],
             "execSlice": [1, 5],
@@ -360,6 +370,13 @@ def selftest() -> int:
     check("num_inference_steps 16", r["num_inference_steps"] == 16)
     check("rot6d 행 규약 명시", "행" in a["rotation"])
     check("곱 순서 명시", a["compose"] == "T_next = T_cur @ A_relative")
+    # D-AI-80: 청크 앵커 규약. 키가 없으면 통과가 아니라 실패다
+    check("청크 앵커 규약 명시",
+          a.get("chunk_anchor") == "chunk_start" and "누적하지 않는다" in a.get("chunk_anchor_note", ""),
+          f"chunk_anchor={a.get('chunk_anchor')!r}")
+    _stripped = {k: v for k, v in a.items() if k != "chunk_anchor"}
+    check("앵커 키 없으면 실패한다 (판별행)",
+          _stripped.get("chunk_anchor") != "chunk_start", "키를 빼도 통과하면 검사가 아니다")
     check("ver1 78.1mm 경고", "78.118819mm" in man["robotSpec"]["WARNING"])
     check("롤아웃 아님 명시", "롤아웃 성공률이 아니다" in man["performance"]["metric"])
     check("contractVersion 미정 표기", man["contractVersion"].startswith("UNSET"))
