@@ -38,15 +38,34 @@ run () {          # $1=태그  $2=추가인자
       --out "checkpoints/bc/_repro_$1.pt" $2 \
       > "$log" 2>&1
   local rc=$?
-  local v
+  local v ne
+  ne=$(grep -cE '^[[:space:]]*epoch[[:space:]]' "$log")
   v=$(grep -E '^[[:space:]]*epoch[[:space:]]' "$log" | tail -1 \
       | grep -oE 'val [0-9]+\.[0-9]+' | sed 's/val //')
+  # ⚠️ 2026-09-20 정정 (황도경 검토) — 초판은 여기서 `exit 1` 을 했다. 그런데 이 함수는
+  #    `A=$(run nd_a "")` 로 **명령치환 서브셸**에서 돌기 때문에 exit 이 서브셸만 죽이고
+  #    부모 스크립트는 그대로 진행했다. `set -e` 도 없었다.
+  #    결과: 학습 2회가 전부 죽어도 빈 값끼리 비교해 **"-> 같다 / 종료코드 0"** 이 나왔고,
+  #    "읽는 법"은 그걸 "재현성은 원래 있었다" 로 안내했다 (재현 확인).
+  #    이제 빈 값을 그대로 돌려주고, 판정은 cmp_two 가 죽인다.
+  echo "    [$1] rc=$rc · epoch줄 $ne · val='${v}'" >&2
   if [ -z "$v" ]; then
-    echo "!! val 을 못 읽었다 (종료코드 $rc). 로그: $log" >&2
+    echo "    !! val 을 못 읽었다. 로그 마지막 5줄:" >&2
     tail -5 "$log" >&2
-    exit 1
   fi
-  echo "$v"
+  printf '%s' "$v"
+}
+
+FAIL=0
+
+cmp_two () {      # $1 $2 = 값 · 빈 값이면 판정 불가로 죽인다
+  if [ -z "$1" ] || [ -z "$2" ]; then
+    echo "  -> !! 판정 불가 — 값이 비었다 ('$1' vs '$2'). 학습이 죽은 것이다."
+    echo "        이 상태의 '같다' 는 재현성의 증거가 아니다. 로그부터 봐라"
+    FAIL=1
+    return 2
+  fi
+  if [ "$1" = "$2" ]; then echo "  -> 같다"; else echo "  -> ⚠️ $3"; fi
 }
 
 echo "=============================================="
@@ -60,7 +79,22 @@ A=$(run nd_a "")
 B=$(run nd_b "")
 echo "  1회차: $A"
 echo "  2회차: $B"
-[ "$A" = "$B" ] && echo "  -> 같다" || echo "  -> ⚠️ 다르다. 시드만으로는 재현되지 않는다"
+cmp_two "$A" "$B" "다르다. 시드만으로는 재현되지 않는다"
+
+# 판별 행 — 차단 검사만 있으면 "계측기가 차이를 못 본다"와 "재현된다"가 같은 출력이다.
+# 시드가 다르면 값도 달라야 한다. 같게 나오면 시드가 안 먹거나 val 추출이 뭉개진 것이다.
+echo
+echo "[판별행] 시드가 다르면 값도 달라야 한다"
+Z=$(run seed1 "--seed 1")
+echo "  시드1: $Z"
+if [ -z "$A" ] || [ -z "$Z" ]; then
+  echo "  -> !! 판정 불가 — 값이 비었다"; FAIL=1
+elif [ "$A" = "$Z" ]; then
+  echo "  -> !! 시드 0 과 1 의 val 이 같다. 계측기가 차이를 못 본다."
+  echo "        위 [1] 의 '같다' 는 증거가 아니다"; FAIL=1
+else
+  echo "  -> 다르다 (계측기가 차이를 본다)"
+fi
 
 echo
 echo "[2/2] 결정론 모드 (--deterministic)"
@@ -68,7 +102,7 @@ C=$(run d_a "--deterministic")
 D=$(run d_b "--deterministic")
 echo "  1회차: $C"
 echo "  2회차: $D"
-[ "$C" = "$D" ] && echo "  -> 같다" || echo "  -> ⚠️ 여전히 다르다. 남은 비결정 원인이 있다"
+cmp_two "$C" "$D" "여전히 다르다. 남은 비결정 원인이 있다"
 
 echo
 echo "읽는 법"
@@ -78,5 +112,10 @@ echo "  · [1] 같다             -> 재현성은 원래 있었다. 캠페인 �
 echo
 echo "⚠️ 재현되더라도 **시드 간 편차는 그대로다.** 이것은 '같은 시드가 같은 값을"
 echo "   내는가' 이지 '조건을 한 시드로 판정해도 되는가' 가 아니다. 후자는 아니다."
+echo
+echo "⚠️ 조건: 이 측정은 **구 경로(BC)** 다 — tools/train_bc.py · datasets/mix_cmd."
+echo "   현행 메인은 handoff 의 공식 UMI diffusion 이다. 이 결과를 현행 스택 근거로"
+echo "   쓰지 마라. handoff/diffusion 경로는 별도 측정 대상이다."
+exit $FAIL
 echo
 echo "정리: rm -f checkpoints/bc/_repro_*.pt"

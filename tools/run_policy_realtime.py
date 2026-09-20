@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -434,6 +435,31 @@ def main() -> None:
     print(f"[카메라] 입력 {w}x{h} → 224x224")
 
     # 3) 로봇
+    # ⚠️ 2026-09-20 — 실물 전송 경로의 안전 임계값은 **여기서 정하지 않는다.**
+    #    so101_infer 의 설정(AI/configs/real/so101_safety.json)에서만 읽고,
+    #    누락·null·NaN 이면 버스를 열기 전에 죽는다 (fail-closed).
+    #    초판은 이 경로에 상한이 아예 없어서, 현석 실물 로그의 wrist_roll -150.4도와
+    #    arm_delta -1784(300틱 초과)를 우리 러너는 한 번도 검사하지 않았다.
+    MAX_STEP_RAD = WRIST_ROLL_MIN_RAD = WRIST_ROLL_MAX_RAD = None
+    MAX_STEP_TICK = WRIST_ROLL_INDEX = None
+    WAYPOINT_DT_S = 1.0 / 10.0                  # 공칭. --dt 로 덮을 수 있게 아래서 갱신
+    if not a.no_robot and not a.dry_run:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "deploy"))
+        from so101_infer import load_safety, SafetyUnset
+        from so101_infer import WRIST_ROLL_INDEX as _WRI
+        try:
+            _SF = load_safety()
+        except SafetyUnset as exc:
+            raise SystemExit(f"!! 안전 설정 미확정 — 실물 전송을 시작하지 않는다.\n{exc}")
+        MAX_STEP_RAD = _SF["max_step_rad"]
+        MAX_STEP_TICK = int(_SF["max_step_tick"])
+        WRIST_ROLL_MIN_RAD = _SF["wrist_roll_min_rad"]
+        WRIST_ROLL_MAX_RAD = _SF["wrist_roll_max_rad"]
+        WRIST_ROLL_INDEX = _WRI
+        print(f"안전 설정 로드: 스텝 {MAX_STEP_TICK}틱({math.degrees(MAX_STEP_RAD):.2f}도) · "
+              f"wrist_roll [{math.degrees(WRIST_ROLL_MIN_RAD):.1f}, "
+              f"{math.degrees(WRIST_ROLL_MAX_RAD):.1f}]도")
+
     bus = None
     if not a.no_robot:
         import replay_trajectory as rt
@@ -517,9 +543,11 @@ def main() -> None:
                     q_new = env.ik(pos, Rm, seed=q_cur, strict=False)
                 except Exception as exc:                # noqa: BLE001
                     print(f"  [{it}] IK 예외 {type(exc).__name__} — 이 스텝 건너뜀")
+                    rejected += 1                       # R6: 초판은 이걸 안 셌다
                     continue
                 if q_new is None:
                     print(f"  [{it}] IK 해 없음 — 건너뜀")
+                    rejected += 1                       # R6: 초판은 이걸 안 셌다
                     continue
                 Tc = fk(q_new)
                 res = float(np.linalg.norm(Tc[:3, 3] - pos))
@@ -529,13 +557,45 @@ def main() -> None:
                     continue
                 gap_new = float(np.clip(target[6], 0.0, 0.09))
 
+                # ⚠️ 2026-09-20 정정 (황도경 검토) — 초판은 여기서 세 가지가 뚫려 있었다.
+                #  R1 preflight 를 **문(statement)으로만** 부르고 반환값을 안 봤다.
+                #     관절한계 밖이어도 바로 다음 줄에서 조건 없이 bus.move 가 나갔다.
+                #  R2 웨이포인트를 1개씩 넘겨서 연속 두 점의 차분을 보는 max_step·speed
+                #     검사가 구조적으로 checked=0 이 됐다. 게다가 4개를 대기 없이 연속
+                #     전송하므로 서보는 **마지막 목표만** 추종한다 — 0.1초 간격 4번의
+                #     35mm 가 아니라 최대 140mm 한 번의 점프가 된다.
+                #  → 관절 공간 스텝 상한을 여기서 직접 걸고, 전송 후 dt 만큼 기다린다.
+                step_rad = float(np.max(np.abs(np.asarray(q_new, float) - q_cur)))
+                if step_rad > MAX_STEP_RAD + 1e-9:
+                    print(f"  [{it}] 관절 스텝 {math.degrees(step_rad):.2f}도 > "
+                          f"{math.degrees(MAX_STEP_RAD):.2f}도 ({MAX_STEP_TICK}틱) — 전송 거부")
+                    rejected += 1
+                    continue
+                wr = float(q_new[WRIST_ROLL_INDEX])
+                if not (WRIST_ROLL_MIN_RAD <= wr <= WRIST_ROLL_MAX_RAD):
+                    print(f"  [{it}] wrist_roll {math.degrees(wr):.1f}도 가 실물 범위 "
+                          f"[{math.degrees(WRIST_ROLL_MIN_RAD):.0f}, "
+                          f"{math.degrees(WRIST_ROLL_MAX_RAD):.0f}]도 밖 — 전송 거부")
+                    rejected += 1
+                    continue
+
                 if bus is not None and not a.dry_run:
                     import replay_trajectory as rt
-                    rt.preflight([list(q_new)], [gap_new])
+                    rep = rt.preflight([list(q_new)], [gap_new])
+                    # 반환값 규약이 무엇이든 "통과 아님"이면 안 보낸다. dict 면 ok 키를,
+                    # 그 외에는 falsy 여부를 본다. None 만 "검사 없음"으로 통과시킨다.
+                    ok = True if rep is None else (rep.get("ok", False)
+                                                   if isinstance(rep, dict) else bool(rep))
+                    if not ok:
+                        detail = rep.get("fail") if isinstance(rep, dict) else rep
+                        print(f"  [{it}] preflight 불합격 {detail} — 전송 거부")
+                        rejected += 1
+                        continue
                     for j, r in zip(rt.JOINTS, q_new):
                         bus.move(j[1], rt.joint_to_tick(j, r))
                     bus.move(rt.GRIPPER[1], rt.gripper_to_tick(gap_new))
                     sent += 1
+                    time.sleep(WAYPOINT_DT_S)   # R2: 서보가 이 점을 실제로 지나게 둔다
                 q_cur, gap_cur = np.asarray(q_new, float), gap_new
                 log.append({"iter": it, "pos": pos.tolist(), "gap_m": gap_new,
                             "q": [float(v) for v in q_new], "ik_residual_m": res})

@@ -235,6 +235,23 @@ def rotation_error_split(R_target: np.ndarray, R_actual: np.ndarray) -> tuple[fl
     return float(np.degrees(about)), float(np.degrees(perp))
 
 
+def step_dt(dts, i0: int, i: int) -> float:
+    """dt between local waypoints i-1 and i, read from the GLOBAL dts array.
+    지역 인덱스 i-1→i 사이의 dt 를 **전역** dts 에서 읽는다.
+
+    qs 는 span 의 lo(=i0) 부터 채운 지역 인덱스이고 dts 는 에피소드 전역이다.
+    초판은 dts[i-1] 로 읽어 lo 만큼 어긋났다 (2026-09-20 정정).
+    """
+    gi = i0 + i - 1
+    return float(dts[gi]) if 0 <= gi < len(dts) else float("nan")
+
+
+def window_count(n_waypoints: int, horizon: int) -> int:
+    """How many length-H windows fit in a length-L sequence: L-H+1, not L-H.
+    길이 L 안에 들어가는 길이 H 창의 개수. 초판은 L-H 라 마지막 창을 늘 빠뜨렸다."""
+    return max(0, n_waypoints - horizon + 1)
+
+
 def check_episode(env, chain: np.ndarray, T_base_home: np.ndarray, limits: dict,
                   horizon: int, ik_tol: float, dts: np.ndarray,
                   span: tuple[int, int] | None = None) -> dict:
@@ -304,7 +321,12 @@ def check_episode(env, chain: np.ndarray, T_base_home: np.ndarray, limits: dict,
     for i in range(1, len(qs)):
         if qs[i] is None or qs[i - 1] is None:
             continue
-        dt = float(dts[i - 1]) if i - 1 < len(dts) else float("nan")
+        # ⚠️ 2026-09-20 정정 (황도경 검토) — qs 는 span 의 lo 부터 채운 **지역 인덱스**인데
+        #    dts 는 에피소드 **전역 인덱스**다. 초판은 dts[i-1] 로 읽어 lo 만큼 어긋났다.
+        #    --segment grasp 는 lo = closure-2 이므로 항상 어긋난다. v10 은 간격이 균일하지
+        #    않아 (재현: 앞 20행 0.05초 · 파지 구간 0.30초인 편에서 위반 0 이어야 할 것이
+        #    위반 8 · 확대율 1.6 으로 나왔다) 양방향으로 틀린다.
+        dt = step_dt(dts, i0, i)
         if not np.isfinite(dt) or dt <= 0:
             continue
         v = np.abs(np.asarray(qs[i]) - np.asarray(qs[i - 1])) / dt
@@ -319,13 +341,17 @@ def check_episode(env, chain: np.ndarray, T_base_home: np.ndarray, limits: dict,
                 vio_a += 1
                 need_scale = max(need_scale, math.sqrt(ar))
 
-    n_chunks = max(0, len(ok_way) - horizon)
+    # ⚠️ 2026-09-20 정정 — 길이 L 안에 들어가는 길이 H 창은 L-H+1 개다. 초판은 L-H 라
+    #    **마지막 창 하나를 늘 평가하지 않았다** — 그 창이 파지 직후 리프트 행을 담는다.
+    #    기본값(pre2/post6)이 정확히 L=9, H=8 이라 코드 1 / 실제 2, 즉 분모가 절반이었다.
+    #    ⚠️ 이 수정은 기존 chunk 수치와 게이트 분모를 바꾼다. 재산출 대상이다.
+    n_chunks = window_count(len(ok_way), horizon)
     ok_chunks = sum(1 for i in range(n_chunks) if all(ok_way[i:i + horizon]))
     fin = [r for r in residuals if not math.isnan(r[0])]
     _free = [a for a, _ in splits if not math.isnan(a)]
     _perp = [b for _, b in splits if not math.isnan(b)]
 
-    too_short = len(ok_way) < horizon + 1
+    too_short = len(ok_way) < horizon        # L == H 면 창이 1개 있다. 초판은 버렸다
     return {
         "span": [lo, hi],
         "too_short_for_chunk": bool(too_short),
@@ -495,6 +521,21 @@ def selftest() -> int:
 
         raise SystemExit("!! 관절 한계 변수가 구간 인덱스에 덮어써진다. 수치를 내지 않는다")
 
+
+    # [C-2] dt 를 전역 인덱스에서 읽는가. 파지 구간이 뒤쪽이면 앞 구간 dt 를 읽으면 안 된다
+    dts_t = [0.05] * 20 + [0.30] * 10
+    got_dt = step_dt(dts_t, 20, 1)          # 지역 0→1 = 전역 20→21
+    wrong_dt = dts_t[0]                     # 초판이 읽던 값
+    okc2 = abs(got_dt - 0.30) < 1e-12 and abs(got_dt - wrong_dt) > 1e-9
+    print(f"[C-2] 파지 구간 dt {got_dt:.3f}초 (초판은 {wrong_dt:.3f}초를 읽었다)", end="  ")
+    print("OK" if okc2 else "!! 실패"); bad += not okc2
+
+    # [C-3] 길이 L 안의 길이 H 창 개수. 양성·음성 둘 다 본다
+    cases = [(8, 8, 1), (9, 8, 2), (65, 8, 58), (7, 8, 0)]
+    okc3 = all(window_count(L, H) == want for L, H, want in cases)
+    print(f"[C-3] 창 개수 {[(L, H, window_count(L, H)) for L, H, _ in cases]} "
+          f"(기대 {[w for *_, w in cases]})", end="  ")
+    print("OK" if okc3 else "!! 실패 — 초판은 전부 1 씩 적었다"); bad += not okc3
 
     print(f"\n자체검증 {'통과' if bad == 0 else f'실패 {bad}건'}")
     return 1 if bad else 0
