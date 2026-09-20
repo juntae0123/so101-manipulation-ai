@@ -50,10 +50,36 @@ def stage0(ckpt_path: Path, man: dict | None) -> tuple[int, int, dict]:
     check("최상위에 cfg·state_dicts", {"cfg", "state_dicts"} <= set(keys), str(keys))
     check("state_dicts 는 ema_model 뿐", set(sdk) == {"ema_model"}, str(sdk))
 
-    n = sum(int(v.numel()) for v in sd.get("ema_model", {}).values() if hasattr(v, "numel"))
+    # ⚠️ 2026-09-20 보강 (황도경 검토) — 초판은 세 가지가 "통과"로 세였다:
+    #    (1) manifest 가 없으면 `exp_n is None` 이 True 라 조건이 참이 되어 ok 증가
+    #    (2) 텐서가 0개여도 n=0 을 결과로 돌려줌 (형제 파일 export_deploy_ckpt 는 이미 고쳤다)
+    #    (3) sha256_export 가 manifest 에 있는데 대조하지 않음 — 전송 무결성의 유일한 증거
+    ema = sd.get("ema_model", {})
+    tensors = [v for v in ema.values() if hasattr(v, "numel")]
+    n = sum(int(v.numel()) for v in tensors)
+    check("ema_model 에 텐서가 있다", len(tensors) > 0,
+          f"텐서 {len(tensors)} / 항목 {len(ema)}  ← 0 이면 nParams 0 은 '작다'가 아니라 '없다'다")
     exp_n = (man or {}).get("nParams")
-    check("nParams 가 manifest 와 일치", exp_n is None or n == exp_n,
-          f"{n:,}" + (f" / 기대 {exp_n:,}" if exp_n else " (manifest 없음)"))
+    if exp_n is None:
+        check("nParams 가 manifest 와 일치", False,
+              f"{n:,} / 기대 없음 — manifest 를 안 줬거나 nParams 키가 없다. "
+              "대조 불가는 통과가 아니다 (--manifest 를 줘라)")
+    else:
+        check("nParams 가 manifest 와 일치", n == exp_n, f"{n:,} / 기대 {exp_n:,}")
+
+    exp_sha = (man or {}).get("sha256_export")
+    if exp_sha:
+        import hashlib
+        h = hashlib.sha256()
+        with open(ckpt_path, "rb") as fh:
+            for blk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(blk)
+        got_sha = h.hexdigest()
+        check("sha256 가 manifest 와 일치", got_sha == exp_sha,
+              f"{got_sha[:16]} / 기대 {exp_sha[:16]}")
+    else:
+        check("sha256 가 manifest 와 일치", False,
+              "manifest 에 sha256_export 가 없다 — 전송 무결성을 증명할 수단이 없다")
 
     cfg = p["cfg"]
 
@@ -83,11 +109,25 @@ def stage0(ckpt_path: Path, man: dict | None) -> tuple[int, int, dict]:
             "runtimeSpec.obs_down_sample_steps": man["runtimeSpec"]["obs_down_sample_steps"],
             "runtimeSpec.num_inference_steps": man["runtimeSpec"]["num_inference_steps"],
         }
+        # ⚠️ str() 비교라 둘 다 None 이면 'None' == 'None' 으로 일치가 된다.
+        #    "둘 다 없음"이 "둘 다 맞음"으로 보이지 않게 None 을 따로 센다.
+        both_none = [k for k in exp if got[k] is None and exp[k] is None]
         bad = [k for k in exp if str(got[k]) != str(exp[k])]
-        check("계약값이 manifest 와 일치", not bad,
-              f"{len(exp) - len(bad)} / {len(exp)}" + (f"  불일치 {bad}" if bad else ""))
+        check("계약값이 manifest 와 일치", not bad and not both_none,
+              f"{len(exp) - len(bad) - len(both_none)} / {len(exp)}"
+              + (f"  불일치 {bad}" if bad else "")
+              + (f"  양쪽 모두 None {both_none}" if both_none else ""))
     else:
         print("  [--] manifest 미지정 — 계약 대조 **미실행**")
+
+    # ⚠️ 위 대조는 cfg 와 manifest 가 **서로 같은지**만 본다. 둘 다 'abs' 면 통과한다.
+    #    이 파일 docstring 이 "relative 만 맞다"고 적어놓고 코드는 값을 검사하지 않았다.
+    #    'rel' 은 소스 주석이 legacy buggy 라고 적은 별개 경로다 (2026-09-20, 황도경 검토).
+    apr = at(cfg, "task.pose_repr.action_pose_repr")
+    opr = at(cfg, "task.pose_repr.obs_pose_repr")
+    check("action_pose_repr 가 'relative'", apr == "relative",
+          f"{apr!r}  ← 'abs' 는 기본값이고 'rel' 은 legacy buggy 경로다. 셋 다 에러 없이 돈다")
+    check("obs_pose_repr 가 'relative'", opr == "relative", f"{opr!r}")
 
     use_ema = at(cfg, "training.use_ema")
     check("training.use_ema 가 True", use_ema is True,
@@ -247,6 +287,7 @@ def main() -> None:
 
     o1 = t1 = 0
     skipped = None
+    failed = None
     if a.skip_stage1:
         skipped = "--skip-stage1"
     else:
@@ -256,13 +297,23 @@ def main() -> None:
             print(f"  단계 1: {o1} / {t1}")
         except ImportError as exc:
             skipped = f"의존성 없음: {exc}"
+        # ⚠️ 2026-09-20 (황도경 검토) — 초판은 ImportError 와 그 외 **전부**를 같은
+        #    "미실행" 통에 넣고 "단계 0 이 전부 OK 면 파일은 정상이다" 라고 안내했다.
+        #    state_dict 키·shape 불일치(RuntimeError)는 **이 도구가 잡으라고 만든 결함**인데,
+        #    받는 쪽은 자기 환경 탓으로 읽는다. 환경 문제와 체크포인트 문제를 가른다.
         except Exception as exc:                       # noqa: BLE001 — 사유를 남긴다
-            skipped = f"{type(exc).__name__}: {exc}"
+            failed = f"{type(exc).__name__}: {exc}"
 
     print(f"\n합계 {o0 + o1} / {t0 + t1}")
+    if failed:
+        print(f"!! 단계 1 **실패** — {failed}")
+        print("   이건 환경 문제가 아니라 체크포인트 문제일 가능성이 높다.")
+        print("   (환경 문제라면 ImportError 로 나오고 '미실행' 로 보고된다)")
+        sys.exit(1)
     if skipped:
         print(f"⚠️ 단계 1 **미실행** — {skipped}")
-        print("   단계 0 이 전부 OK 면 파일은 정상이다. 추론 환경에서 다시 돌려라.")
+        print("   단계 0 이 전부 OK 여도 '파일 정상' 이 아니다 — 추론을 한 번도 안 돌렸다.")
+        print("   추론 환경에서 다시 돌려라.")
         sys.exit(2 if o0 == t0 else 1)
     sys.exit(0 if (o0 + o1) == (t0 + t1) else 1)
 

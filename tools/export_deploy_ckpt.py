@@ -290,6 +290,23 @@ def export(src: Path, out: Path, note: str) -> int:
     if blank:
         print(f"\n!! 빈칸 {len(blank)}개 — 받는 쪽이 추측하게 된다. 보내기 전에 채워라.")
         return 1
+
+    # ⚠️ 2026-09-20 (황도경 검토) — 빈칸 검사는 `is None` 만 봤다. cfg 의 pose_repr 이
+    #    'abs' 나 'rel'(소스가 legacy buggy 라 적은 경로)이어도 **값이 있으므로 초록불**이고,
+    #    manifest 는 받는 쪽에 그 값을 쓰라고 지시한다. 이 파일 docstring 이 경고한
+    #    바로 그 경로를 계약서에 박아 내보내는 셈이다. 값 자체를 검사한다.
+    #    수신측(run_policy_realtime)이 이미 != "relative" 로 막는다 —
+    #    **내보내는 쪽이 받는 쪽보다 느슨하면 안 된다.**
+    wrong = {k: v for k, v in (
+        ("runtimeSpec.action_pose_repr", man["runtimeSpec"]["required_kwarg"]["action_pose_repr"]),
+        ("runtimeSpec.obs_pose_repr", man["runtimeSpec"]["obs_pose_repr"]),
+    ) if v != "relative"}
+    if wrong:
+        print(f"\n!! pose_repr 이 'relative' 가 아니다: {wrong}")
+        print("   'abs' 는 기본값이고 'rel' 은 legacy buggy 경로다. 셋 다 에러 없이 돈다.")
+        print("   이 체크포인트는 내보내지 않는다 — 학습 cfg 부터 확인해라.")
+        return 1
+    print(f"  OK  pose_repr 양쪽 모두 'relative'")
     return 0 if ok else 1
 
 

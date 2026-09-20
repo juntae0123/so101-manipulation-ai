@@ -40,11 +40,17 @@ import argparse
 import json
 import math
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
 
 GAP_TOL_M = 0.002
+# 닫힘으로 인정하는 gap 총 이동량 하한. 실 시연 닫힘 gap 중앙 38.5mm [32.4, 43.5] (n=69)
+# 대비 한참 아래로 잡아 정상 편을 떨구지 않으면서 "평평한 편"만 잡는다.
+CLOSURE_MIN_DROP_M = 0.010
+# 복원 교차검증 회전 허용치. 초판은 위치만 게이트에 썼다 (2026-09-20 보강).
+CONSISTENCY_DEG_DEFAULT = 2.0
 ACTION_COLUMNS = ["x_m", "y_m", "z_m", "r0x", "r0y", "r0z", "r1x", "r1y", "r1z", "gap_m"]
 
 
@@ -118,13 +124,34 @@ def chain_consistency(action: np.ndarray, chain: np.ndarray) -> dict:
             "rotation_max_deg": float(np.max(re_))}
 
 
-def closure_row(z, tol: float = GAP_TOL_M) -> tuple[int, float]:
+class ClosureNotFound(ValueError):
+    """The demo never closed — refuse rather than calling row 0 the grasp.
+    닫힌 적이 없는 시연. 0행을 파지 순간이라고 부르는 대신 거부한다."""
+
+
+def closure_row(z, tol: float = GAP_TOL_M,
+                min_drop_m: float = CLOSURE_MIN_DROP_M) -> tuple[int, float]:
     """First row where the jaws stop closing — that is where the object was.
-    턱이 닫힘을 멈춘 첫 행. 물체가 있던 자리다. (행, 그때의 gap[m])"""
+    턱이 닫힘을 멈춘 첫 행. 물체가 있던 자리다. (행, 그때의 gap[m])
+
+    ⚠️ 2026-09-20 보강 — 초판은 `argmax(gap <= min + tol)` 하나였다.
+       gap 이 내내 평평하면 min ≈ gap[0] 이라 **말없이 0 을 돌려준다.** 그러면
+       `T_align = T_grasp @ inv(chain[0])` 이 되어 **시연 첫 프레임이 시뮬 파지
+       pose 에 붙고 전 궤적이 통째로 오프셋된 채** 학습 데이터가 된다.
+       "없음"과 "괜찮음"이 같은 출력이 되는 정확한 형태다. 두 게이트를 건다.
+    """
     gap = np.asarray(z["proprio"], dtype=np.float64)[:, -1, 9]
     if gap.size == 0:
-        raise ValueError("proprio 가 비었다")
+        raise ClosureNotFound("proprio 가 비었다")
+    drop = float(gap.max() - gap.min())
+    if drop < min_drop_m:
+        raise ClosureNotFound(
+            f"gap 총 이동량이 {drop*1000:.2f}mm 뿐이다 (하한 {min_drop_m*1000:.1f}mm). "
+            "닫힌 적이 없거나 신호가 죽었다 — 파지 순간을 특정할 수 없다")
     c = int(np.argmax(gap <= float(gap.min()) + tol))
+    if c == 0 or c == gap.size - 1:
+        raise ClosureNotFound(
+            f"닫힘 최소점이 경계 행({c}/{gap.size - 1})이다 — 구간이 잘렸을 수 있다")
     return c, float(gap[c])
 
 
@@ -199,7 +226,64 @@ def selftest() -> int:
     print(f"[5] 파지 정렬 오차 {err:.3e}", end="  ")
     print("OK" if err < 1e-12 else "!! 실패"); bad += err >= 1e-12
 
-    print(f"\n자체검증 {'통과' if bad == 0 else f'실패 {bad}건'}")
+    # [6] 전치 판별행 — 행/열 규약이 뒤집히면 잡아야 한다. 초판 selftest 는 자기가
+    #     행으로 만들어 넣고 행으로 읽어 비교하는 동어반복이라, 규약이 틀려도 통과했다.
+    act_T = act.copy()
+    for i in range(N):
+        for k in range(H):
+            R = rot6d_to_matrix(act[i, k, 3:6], act[i, k, 6:9]).T      # 전치해 넣는다
+            act_T[i, k, 3:6], act_T[i, k, 6:9] = R[0, :], R[1, :]
+    # ⚠️ 자기 자신과 비교하면 안 된다 — 전치로 넣고 전치로 읽으면 늘 일치한다(동어반복).
+    #    **정답 truth** 와 비교해야 규약 위반이 드러난다.
+    chain_T = reconstruct_chain(act_T)
+    dev = max(geodesic_deg(chain_T[i][:3, :3], truth[i][:3, :3]) for i in range(N + 1))
+    caught6 = dev > 1.0
+    print(f"[6] 전치 입력 감지 — 정답 대비 회전편차 {dev:.3f}deg", end="  ")
+    print("OK" if caught6 else "!! 실패 — 행/열이 뒤집혀도 정답과 같게 나온다")
+    bad += not caught6
+
+    # [7-9] closure_row — "닫힘 없음"과 "0행이 파지"를 가르는 게이트 (2026-09-20)
+    def _mk(gap_seq):
+        """gap 열만 채운 최소 proprio 스텁. z["proprio"][:, -1, 9] 만 읽힌다."""
+        arr = np.zeros((len(gap_seq), 1, 10), dtype=np.float64)
+        arr[:, 0, 9] = gap_seq
+
+        class _Z:
+            files = ["proprio"]
+
+            def __getitem__(self, k):
+                if k != "proprio":
+                    raise KeyError(k)
+                return arr
+
+        return _Z()
+
+    flat = _mk([0.088] * 20)
+    try:
+        closure_row(flat); ok7 = False
+    except ClosureNotFound:
+        ok7 = True
+    print(f"[7] 평평한 gap 거부 (초판은 0행을 파지라 답했다)", end="  ")
+    print("OK" if ok7 else "!! 실패"); bad += not ok7
+
+    edge = _mk([0.030] + [0.088] * 19)          # 최소점이 0행
+    try:
+        closure_row(edge); ok8 = False
+    except ClosureNotFound:
+        ok8 = True
+    print(f"[8] 경계 행 닫힘 거부", end="  ")
+    print("OK" if ok8 else "!! 실패"); bad += not ok8
+
+    good = _mk(list(np.linspace(0.075, 0.038, 12)) + [0.038] * 8)   # 정상 닫힘
+    try:
+        c9, g9 = closure_row(good)
+        ok9 = 0 < c9 < 19 and abs(g9 - 0.038) < 1e-6
+    except ClosureNotFound:
+        c9, g9, ok9 = -1, -1, False
+    print(f"[9] 정상 닫힘 통과 판별행 행 {c9} gap {g9*1000:.1f}mm", end="  ")
+    print("OK" if ok9 else "!! 실패 — 전부 거부하는 게이트는 게이트가 아니다"); bad += not ok9
+
+    print(f"\n자체검증 {'통과' if bad == 0 else f'실패 {bad}건'} (검사 9건)")
     return 1 if bad else 0
 
 
@@ -220,6 +304,8 @@ def main() -> None:
                          "all 로 학습하면 홀드아웃이 학습에 섞인다")
     ap.add_argument("--consistency-mm", type=float, default=1.0,
                     help="복원 교차검증 허용 오차[mm]. 넘으면 그 편을 버린다")
+    ap.add_argument("--consistency-deg", type=float, default=CONSISTENCY_DEG_DEFAULT,
+                    help="복원 교차검증 회전 허용치[도]. 초판은 회전을 게이트에 안 썼다")
     a = ap.parse_args()
 
     if a.selftest:
@@ -250,7 +336,9 @@ def main() -> None:
 
     # 분할을 **먼저** 정한다. 어느 편을 내보내든 분할은 같아야 하기 때문이다.
     # (변환 후에 나누면 --only 마다 분할이 달라질 수 있다)
-    all_eps = list(meta["episodes"])
+    # ⚠️ 정렬 후 셔플한다. 초판은 JSON 의 배열 순서를 그대로 셔플해서, 데이터셋을
+    #    재생성해 순서가 바뀌면 같은 --split-seed 로 다른 분할이 나왔다 (2026-09-20).
+    all_eps = sorted(meta["episodes"])
     rng0 = np.random.default_rng(a.split_seed)
     shuffled = list(all_eps)
     rng0.shuffle(shuffled)
@@ -264,7 +352,8 @@ def main() -> None:
     print(f"분할 시드 {a.split_seed} · 홀드아웃 {a.holdout}편 · 이번 출력 = {a.only} ({len(want)}편)")
 
     rgb, pos, rot, grip, ends = [], [], [], [], []
-    kept, dropped, gaps = [], [], []
+    start_pose, end_pose = [], []          # F3: 편별 시작/끝 pose (프레임 pose 가 아니다)
+    kept, dropped, gaps, kept_cc, ep_start6, ts_stats = [], [], [], [], [], []
     total = 0
 
     for name in want:
@@ -277,27 +366,79 @@ def main() -> None:
         pro = np.asarray(z["proprio"], dtype=np.float64)  # (N,2,10)
         if act.shape[2] != len(ACTION_COLUMNS):
             dropped.append({"episode": name, "reason": f"action 열 {act.shape[2]}"}); continue
+        # proprio 도 검사한다. 아래에서 pro[:, -1, 9] 를 직접 인덱싱하므로, 레이아웃이
+        # 바뀌면 gap 이 아닌 채널을 읽고도 IndexError 없이 진행한다 (2026-09-20 보강).
+        if pro.ndim != 3 or pro.shape[2] < 10:
+            dropped.append({"episode": name,
+                            "reason": f"proprio 형상 {tuple(pro.shape)} — gap 열(9) 없음"}); continue
         if img.shape[0] != act.shape[0] or pro.shape[0] != act.shape[0]:
             dropped.append({"episode": name, "reason": "행 수 불일치"}); continue
 
         chain = reconstruct_chain(act)
         cc = chain_consistency(act, chain)
-        if cc["comparisons"] == 0 or cc["position_max_mm"] > a.consistency_mm:
-            dropped.append({"episode": name, "reason": "복원 교차검증 실패",
+        if cc["comparisons"] == 0:
+            dropped.append({"episode": name, "reason": "복원 교차검증 비교 0건",
+                            "consistency": cc}); continue
+        if cc["position_max_mm"] > a.consistency_mm:
+            dropped.append({"episode": name, "reason": "복원 교차검증 위치 초과",
+                            "consistency": cc}); continue
+        # ⚠️ 초판은 rotation_max_deg 를 계산해 놓고 게이트에 쓰지 않았다 (2026-09-20).
+        #    위치가 완벽하고 회전만 20도 틀어진 편이 1mm 게이트를 통과해 학습에 들어갔다.
+        #    회전은 r0/r1 행-열 규약이 지배하는 축이고, 그 규약의 런타임 계측기가 이것뿐이다.
+        if cc["rotation_max_deg"] > a.consistency_deg:
+            dropped.append({"episode": name, "reason": "복원 교차검증 회전 초과",
                             "consistency": cc}); continue
 
-        c, gmm = closure_row(z)
+        try:
+            c, gmm = closure_row(z)
+        except ClosureNotFound as exc:
+            dropped.append({"episode": name, "reason": "닫힘 검출 실패",
+                            "detail": str(exc)}); continue
         gaps.append(gmm * 1000)
+        # ⚠️ docstring 은 "시각은 observation_timestamp 에서 읽는다"고 단언하는데
+        #    초판 코드에는 그 문자열이 한 번도 없었다 (2026-09-20). 균일 레이트로 나가면서
+        #    불균일을 기록조차 안 했다. 지금도 리샘플은 하지 않는다 — 다만 **잰다**.
+        ts_stat = {"source": None, "note": "타임스탬프 필드 없음 — 균일 가정 미검증"}
+        for key in ("observation_timestamp", "source_row"):
+            if key in getattr(z, "files", []):
+                v = np.asarray(z[key], dtype=np.float64).ravel()
+                if v.size >= 2:
+                    dv = np.diff(v)
+                    ts_stat = {"source": key, "n": int(v.size),
+                               "step_min": float(dv.min()), "step_max": float(dv.max()),
+                               "step_median": float(np.median(dv)),
+                               "uniform": bool(np.allclose(dv, dv[0]))}
+                break
+        ts_stats.append({"episode": name, **ts_stat})
+        # 통과한 편의 잔차도 남긴다. 초판은 dropped 에만 실어서, 사후에
+        # "얼마나 아슬아슬하게 통과했나"를 볼 수 없었다.
+        kept_cc.append({"episode": name, "closure_row": c, "closure_gap_mm": gmm * 1000,
+                        "position_max_mm": cc["position_max_mm"],
+                        "rotation_max_deg": cc["rotation_max_deg"],
+                        "comparisons": cc["comparisons"]})
         T_align = T_grasp @ np.linalg.inv(chain[c])
 
         n = act.shape[0]
+        ep_pose = []
         for i in range(n):
             T = T_align @ chain[i]
             frame = img[i, -1]                            # 현재 관측 (3,224,224)
             rgb.append(np.ascontiguousarray(frame.transpose(1, 2, 0)))   # HWC
+            p6 = np.r_[T[:3, 3], matrix_to_rotvec(T[:3, :3])]
+            ep_pose.append(p6)
             pos.append(T[:3, 3].astype(np.float32))
             rot.append(matrix_to_rotvec(T[:3, :3]).astype(np.float32))
             grip.append(np.array([pro[i, -1, 9]], dtype=np.float32))
+        # ⚠️ 초판은 프레임별 현재 pose 를 start 에도 end 에도 그대로 넣었다 (start==end==current).
+        #    demo_start 기준 상대 pose 를 쓰는 경로에서는 전 프레임이 항등원이 된다 —
+        #    학습은 정상으로 돌고 loss 도 내려가지만 조건 입력이 상수다 (2026-09-20).
+        sp_ep, ep_ep = ep_pose[0], ep_pose[-1]
+        start_pose.extend([sp_ep] * n)
+        end_pose.extend([ep_ep] * n)
+        ep_start6.append({"episode": name,
+                          "start_pose_6dof": [round(float(v), 6) for v in sp_ep],
+                          "end_pose_6dof": [round(float(v), 6) for v in ep_ep],
+                          "frames": n})
         total += n
         ends.append(total)
         kept.append(name)
@@ -324,9 +465,10 @@ def main() -> None:
     data.create_dataset("robot0_eef_pos", data=np.stack(pos), dtype="float32")
     data.create_dataset("robot0_eef_rot_axis_angle", data=np.stack(rot), dtype="float32")
     data.create_dataset("robot0_gripper_width", data=np.stack(grip), dtype="float32")
-    sp = np.concatenate([np.stack(pos), np.stack(rot)], axis=1).astype(np.float64)
-    data.create_dataset("robot0_demo_start_pose", data=sp, dtype="float64")
-    data.create_dataset("robot0_demo_end_pose", data=sp, dtype="float64")
+    data.create_dataset("robot0_demo_start_pose",
+                        data=np.stack(start_pose).astype(np.float64), dtype="float64")
+    data.create_dataset("robot0_demo_end_pose",
+                        data=np.stack(end_pose).astype(np.float64), dtype="float64")
     root.create_group("meta").create_dataset("episode_ends", data=np.array(ends, dtype=np.int64))
     store.close()
 
@@ -339,13 +481,26 @@ def main() -> None:
         "rotation_convention": "r0,r1 = first two ROWS of R (2026-09-17 스윕 확정)",
         "composition": "T_next = T_cur @ A_relative",
         "rate_hz": meta["rate_hz"], "source_action_horizon": meta["action_horizon"],
-        "episodes_kept": len(kept), "frames": total,
+        "episodes_requested": len(want), "episodes_kept": len(kept),
+        "episodes_dropped": len(dropped), "frames": total,
+        # ⚠️ 초판은 개수만 남겨서 "어느 편이 학습에 들어갔나"를 사후에 답할 수 없었다.
+        #    같은 원본에서 트랙A 74편 / HW v4 76편 / 공통 64편이 나온 사고와 같은 모양이다.
+        "episodes_kept_names": list(kept),
+        "episode_ends": [int(x) for x in ends],
+        "episode_ends_note": "episode_ends[i] 는 episodes_kept_names[i] 의 끝 프레임이다",
         "dropped": dropped,
+        "dropped_by_reason": {k: v for k, v in sorted(Counter(
+            x["reason"] for x in dropped).items(), key=lambda kv: -kv[1])},
+        "kept_consistency": kept_cc,
+        "timestamps": ts_stats,
         "closure_gap_mm": {"median": gs[len(gs) // 2], "min": gs[0], "max": gs[-1]},
         "only": a.only,
         "split": {"seed": a.split_seed, "train": len(train), "holdout": len(hold),
-                  "note": "분할은 원본 70편 전체에 대해 정해진다. --only 는 그중 어느 쪽을 "
-                          "내보낼지만 고른다. 학습=train, 평가=holdout"},
+                  "note": f"분할은 원본 {len(all_eps)}편 전체에 대해 정해진다. --only 는 "
+                          "그중 어느 쪽을 내보낼지만 고른다. 학습=train, 평가=holdout. "
+                          "탈락 편은 여기서 빠지지 않으므로 분모로 쓰지 마라 — "
+                          "실제로 zarr 에 들어간 것은 converted_this_run 이다"},
+        "episode_start_pose_6dof": ep_start6,
         "limitations": [
             "물체 배치 시드 1개만 사용",
             "접근 경로 미측정 ([ROS] MoveIt 범위)",
@@ -354,13 +509,32 @@ def main() -> None:
     }
     Path(str(out) + ".provenance.json").write_text(
         json.dumps(prov, indent=2, ensure_ascii=False), encoding="utf-8")
+    # ⚠️ 초판 split.json 은 드랍을 반영하지 않았다. `--only holdout` 로 14편을 뽑을 때
+    #    3편이 탈락해 zarr 가 11편이어도 holdout 14편이라고 말했고, 평가가 그걸 분모로
+    #    삼으면 성공률 분모가 3편 부풀려진다 (2026-09-20).
     Path(str(out) + ".split.json").write_text(
-        json.dumps({"seed": a.split_seed, "train": train, "holdout": hold},
+        json.dumps({"seed": a.split_seed, "train": train, "holdout": hold,
+                    "only": a.only,
+                    "requested_this_run": list(want),
+                    "converted_this_run": list(kept),
+                    "dropped_this_run": [{"episode": x["episode"], "reason": x["reason"]}
+                                         for x in dropped],
+                    "note": "train/holdout 은 탈락 전 계획이다. 분모로 쓸 것은 "
+                            "converted_this_run 이다"},
                    indent=2, ensure_ascii=False), encoding="utf-8")
 
-    print(f"\n변환 {len(kept)}편 · 프레임 {total} · 버림 {len(dropped)}편")
-    if dropped:
-        print("  버린 이유:", {x["reason"] for x in dropped})
+    # ⚠️ 부분합이 전체와 같은지 확인한다. 폐기 경로를 하나만 세면 조용히 틀린다.
+    if len(kept) + len(dropped) != len(want):
+        raise SystemExit(f"!! 집계가 안 맞는다. 요청 {len(want)} != 통과 {len(kept)} + "
+                         f"탈락 {len(dropped)}. 세지 않은 폐기 경로가 있다")
+    print(f"\n변환 {len(kept)}/{len(want)}편 · 프레임 {total} · 버림 {len(dropped)}/{len(want)}편")
+    for reason, cnt in sorted(Counter(x["reason"] for x in dropped).items(),
+                              key=lambda kv: -kv[1]):
+        print(f"  버림 {cnt}/{len(want)}편 — {reason}")
+    nonuni = [t for t in ts_stats if t.get("uniform") is False]
+    nots = [t for t in ts_stats if t.get("source") is None]
+    print(f"시간축: 잰 편 {len(ts_stats) - len(nots)}/{len(ts_stats)} · "
+          f"불균일 {len(nonuni)}편 (리샘플은 하지 않는다 — 기록만)")
     print(f"분할 고정 (시드 {a.split_seed}) — 학습 {len(train)}편 / 홀드아웃 {len(hold)}편")
     if a.only == "all":
         print("!! --only all 이다. 이 zarr 로 학습하면 홀드아웃이 학습에 섞인다. "
