@@ -480,13 +480,18 @@ def selftest() -> int:
 
     body = src[src.index("def check_episode("):src.index("# \u2500\u2500 \uc790\uccb4 \uac80\uc99d")]
 
-    bad = ("lo, hi = env.limits" in body) and ("lo, hi = span" in body)
+    # ⚠️ 2026-09-20 정정 — 초판은 여기서 `bad` 에 **재대입**했다. 그 순간 위 [1]~[4]
+    #    의 실패 카운트가 통째로 사라져, rot6d 를 열로 되돌려도 "자체검증 통과 · EXIT 0"
+    #    이 나왔다(실증). 247행 주석이 경고한 `lo, hi` 이름 충돌과 **같은 종류의 실수**가
+    #    같은 파일 안에서 재발했다. 이름을 분리한다.
+    name_clash = ("lo, hi = env.limits" in body) and ("lo, hi = span" in body)
+    bad += 1 if name_clash else 0
 
-    print(f"[{'!!' if bad else 'OK'}] 관절한계·구간인덱스 이름 분리 "
+    print(f"[{'!!' if name_clash else 'OK'}] 관절한계·구간인덱스 이름 분리 "
 
           f"(q_lo/q_hi {'있음' if 'q_lo' in body else '없음'})")
 
-    if bad:
+    if name_clash:
 
         raise SystemExit("!! 관절 한계 변수가 구간 인덱스에 덮어써진다. 수치를 내지 않는다")
 
