@@ -398,18 +398,37 @@ def main() -> None:
         # ⚠️ docstring 은 "시각은 observation_timestamp 에서 읽는다"고 단언하는데
         #    초판 코드에는 그 문자열이 한 번도 없었다 (2026-09-20). 균일 레이트로 나가면서
         #    불균일을 기록조차 안 했다. 지금도 리샘플은 하지 않는다 — 다만 **잰다**.
-        ts_stat = {"source": None, "note": "타임스탬프 필드 없음 — 균일 가정 미검증"}
+        # ⚠️ 2026-09-20 2차 정정 — 초판 계측이 두 군데 틀렸다.
+        #  (1) observation_timestamp 는 (N, history) 2차원이다. ravel 하면
+        #      [t0,t1 | t1,t2 | t2,t3] 가 1열로 펴져 간격의 절반이 0 으로 나온다.
+        #      실제로 74편 전부 "불균일"로 찍혔는데, 현재 관측열만 보면 0.1초 균일이었다.
+        #      proprio[:, -1, 9] 와 같은 규약 — history 축의 **마지막이 현재**다.
+        #  (2) uniform 을 np.allclose(dv, dv[0]) 로 봤다. 첫 간격 하나에 전부를 건다.
+        #      중앙값 대비 상대편차로 바꾼다.
+        #  observation_timestamp(관측 시각)와 source_row(원본 30fps 프레임 인덱스)는
+        #  **다른 축이다.** "간격 2·3 혼재"는 source_row 쪽 이야기다. 둘 다 잰다.
+        ts_stat = {"episode": name}
         for key in ("observation_timestamp", "source_row"):
-            if key in getattr(z, "files", []):
-                v = np.asarray(z[key], dtype=np.float64).ravel()
-                if v.size >= 2:
-                    dv = np.diff(v)
-                    ts_stat = {"source": key, "n": int(v.size),
-                               "step_min": float(dv.min()), "step_max": float(dv.max()),
-                               "step_median": float(np.median(dv)),
-                               "uniform": bool(np.allclose(dv, dv[0]))}
-                break
-        ts_stats.append({"episode": name, **ts_stat})
+            if key not in getattr(z, "files", []):
+                ts_stat[key] = {"present": False,
+                                "note": "필드 없음 — 균일 가정 미검증. 0 이 아니라 '못 쟀다'"}
+                continue
+            arr = np.asarray(z[key], dtype=np.float64)
+            v = arr[:, -1] if arr.ndim == 2 else arr.ravel()
+            if v.size < 2:
+                ts_stat[key] = {"present": True, "n": int(v.size),
+                                "note": "행이 2개 미만 — 간격을 못 잰다"}
+                continue
+            dv = np.diff(v)
+            med = float(np.median(dv))
+            rel = float(np.max(np.abs(dv - med)) / abs(med)) if abs(med) > 1e-12 else float("inf")
+            ts_stat[key] = {
+                "present": True, "n": int(v.size), "history_axis": bool(arr.ndim == 2),
+                "step_min": float(dv.min()), "step_max": float(dv.max()), "step_median": med,
+                "max_rel_dev": rel, "uniform": bool(rel <= 0.05),
+                "n_zero_steps": int((np.abs(dv) <= 1e-12).sum()),
+            }
+        ts_stats.append(ts_stat)
         # 통과한 편의 잔차도 남긴다. 초판은 dropped 에만 실어서, 사후에
         # "얼마나 아슬아슬하게 통과했나"를 볼 수 없었다.
         kept_cc.append({"episode": name, "closure_row": c, "closure_gap_mm": gmm * 1000,
@@ -531,10 +550,16 @@ def main() -> None:
     for reason, cnt in sorted(Counter(x["reason"] for x in dropped).items(),
                               key=lambda kv: -kv[1]):
         print(f"  버림 {cnt}/{len(want)}편 — {reason}")
-    nonuni = [t for t in ts_stats if t.get("uniform") is False]
-    nots = [t for t in ts_stats if t.get("source") is None]
-    print(f"시간축: 잰 편 {len(ts_stats) - len(nots)}/{len(ts_stats)} · "
-          f"불균일 {len(nonuni)}편 (리샘플은 하지 않는다 — 기록만)")
+    for key in ("observation_timestamp", "source_row"):
+        got = [t[key] for t in ts_stats if t.get(key, {}).get("uniform") is not None]
+        if not got:
+            print(f"시간축 {key}: 잰 편 0/{len(ts_stats)} — 필드가 없다 (균일 가정 미검증)")
+            continue
+        nonuni = [g for g in got if not g["uniform"]]
+        meds = sorted(g["step_median"] for g in got)
+        print(f"시간축 {key}: 잰 편 {len(got)}/{len(ts_stats)} · 불균일 {len(nonuni)}편 "
+              f"· 간격 중앙 {meds[len(meds)//2]:.4f} [{meds[0]:.4f}, {meds[-1]:.4f}] "
+              f"(리샘플은 하지 않는다 — 기록만)")
     print(f"분할 고정 (시드 {a.split_seed}) — 학습 {len(train)}편 / 홀드아웃 {len(hold)}편")
     if a.only == "all":
         print("!! --only all 이다. 이 zarr 로 학습하면 홀드아웃이 학습에 섞인다. "
