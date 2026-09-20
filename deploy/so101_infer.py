@@ -126,16 +126,27 @@ def action_to_T(a10) -> tuple[np.ndarray, float]:
 
 
 def unroll(T_start, chunks, exec_slice=EXEC_SLICE) -> tuple[list, list]:
-    """상대 액션 청크들을 절대 TCP 궤적으로 편다. T_next = T_cur @ A_relative."""
+    """상대 액션 청크들을 절대 TCP 궤적으로 편다.
+
+    ⚠️ 2026-09-20 정정 (D-AI-80). 초판은 청크 **안에서** `T = T @ A` 로 누적했다.
+    v10 실데이터 20편 · 비교 5648건에서 앵커 `T0 @ A[k]` 만 오차 0.0000mm 였다:
+        누적 T0@A0@..@Ak   위치 중앙  59.7291 mm
+        앵커 T0@Ak         위치 중앙   0.0000 mm   ← 정답
+        초판 공식           위치 중앙  44.7580 mm (k=1 0.0 / 2 40.1 / 3 98.3 / 4 171.3)
+    액션 한 행은 전부 **청크 시작 pose 기준**이다. 청크 안에서 앵커는 바뀌지 않는다.
+    청크 사이에서만 앵커가 마지막 실행점으로 넘어간다 (실물에서는 재관측 pose).
+    근거: AI/tools/probe_chunk_anchor.py · out/anchor_0920.json
+    """
     lo, hi = exec_slice
     T, poses, gaps = np.asarray(T_start, float).copy(), [], []
     for ch in chunks:
         ch = np.asarray(ch, float)
         if ch.shape != (ACTION_HORIZON, ACTION_DIM):
             raise ValueError(f"청크 shape {ch.shape}, 기대 ({ACTION_HORIZON},{ACTION_DIM})")
+        T0 = T.copy()                    # 이 청크의 앵커. 청크 안에서 고정이다
         for row in ch[lo:hi]:
             A, gap = action_to_T(row)
-            T = T @ A
+            T = T0 @ A
             poses.append(T.copy())
             gaps.append(gap)
     return poses, gaps
@@ -375,6 +386,18 @@ def _selftest() -> int:
     ch[:, 0] = 0.002; ch[:, 9] = 0.05
     p, g = unroll(np.eye(4), [ch, ch])
     chk("5 unroll 길이", len(p) == 2 * (EXEC_SLICE[1] - EXEC_SLICE[0]), f"{len(p)}/8")
+    # [5b-5d] 앵커 규약 정답 아는 행 (D-AI-80). 길이만 보면 누적/앵커가 같은 출력이다
+    _lo, _hi = EXEC_SLICE
+    _n = _hi - _lo
+    _exp = [0.002] * _n                                   # 앵커면 청크 안에서 전부 같다
+    _got = [float(P[0, 3]) for P in p[:_n]]
+    chk("5b 청크 안은 앵커다 (누적 아님)", np.allclose(_got, _exp, atol=1e-12),
+        f"x={[round(v, 5) for v in _got]} · 기대 {_exp}")
+    _accum = np.cumsum(_exp).tolist()                     # 누적이면 이렇게 나온다
+    chk("5c 누적/앵커가 갈리는 입력이다 (판별행)", not np.allclose(_accum, _exp),
+        f"누적이면 x={[round(v, 5) for v in _accum]}")
+    chk("5d 청크 경계에서만 앵커가 넘어간다",
+        abs(float(p[_n][0, 3]) - 0.004) < 1e-12, f"{float(p[_n][0, 3]):.6f} · 기대 0.004000")
     bad = ch[0].copy(); bad[9] = 0.5
     try:
         action_to_T(bad); chk("6 gap 범위 거부", False)
