@@ -179,6 +179,20 @@ def selftest() -> int:
     chk("7 작업 범위 정답 (0.05,0.02,0.05)",
         np.allclose(ext, [0.05, 0.02, 0.05], atol=1e-4), f"{ext}")
 
+    # [8-9] 비교 모드 정답 아는 행. 같은 것은 같다고, 다른 것은 다르다고 해야 한다
+    da, ea = _synth()
+    db, eb = _synth()
+    c_same = compare_arrays(da, db, ea, eb)
+    chk("8 같은 데이터 -> 전부 동일", c_same["identical"] == c_same["total"],
+        f"동일 {c_same['identical']}/{c_same['total']}")
+    db2, eb2 = _synth()
+    db2["robot0_eef_pos"] = db2["robot0_eef_pos"].copy()
+    db2["robot0_eef_pos"][3, 0] += 0.001                 # 1mm 만 흔든다
+    c_diff = compare_arrays(da, db2, ea, eb2)
+    chk("9 1mm 차이를 잡아낸다 (판별행)",
+        c_diff["identical"] == c_diff["total"] - 1,
+        f"동일 {c_diff['identical']}/{c_diff['total']}")
+
     for nm, ok, note in log:
         print(f"  {'OK ' if ok else 'FAIL'}  {nm}" + (f"   {note}" if note else ""))
     print(f"\n자체검증 {len(log) - bad}/{len(log)}")
@@ -195,16 +209,62 @@ def _boundary_rejected() -> bool:
         return True
 
 
+def open_zarr(path: Path):
+    """Open a zarr directory or .zip store. 디렉터리든 .zip 이든 연다."""
+    import zarr
+    p = str(path)
+    if p.endswith(".zip"):
+        return zarr.open(zarr.ZipStore(p, mode="r"), mode="r")
+    return zarr.open(p, mode="r")
+
+
 def load_zarr(path: Path) -> tuple[dict, np.ndarray]:
     """Read arrays we need. 필요한 배열만 읽는다 (이미지는 건드리지 않는다)."""
-    import zarr
-    z = zarr.open(str(path), mode="r")
-    missing = [k for k in KEYS if k not in z["data"]]
+    z = open_zarr(path)
+    have = sorted(z["data"].array_keys())
+    missing = [k for k in KEYS if k not in have]
     if missing:
-        raise SystemExit(f"!! 배열 누락 {missing} — 있는 것 {sorted(z['data'].array_keys())}")
+        raise SystemExit(f"!! 배열 누락 {missing} — 있는 것 {have}")
     data = {k: np.asarray(z["data"][k]) for k in KEYS}
     ends = np.asarray(z["meta"]["episode_ends"])
     return data, ends
+
+
+def compare_arrays(a: dict, b: dict, ends_a: np.ndarray, ends_b: np.ndarray) -> dict:
+    """Are two datasets the same data? 두 데이터셋이 같은 내용인가.
+
+    zip 은 mtime 을 헤더에 담으므로 **같은 내용을 다시 압축만 해도 sha256 이 달라진다.**
+    해시 차이는 내용 차이의 증거가 아니다. 배열을 직접 대조한다.
+    """
+    rows, same = [], 0
+    pairs = [(k, a.get(k), b.get(k)) for k in KEYS] + [("episode_ends", ends_a, ends_b)]
+    for k, x, y in pairs:
+        if x is None or y is None:
+            rows.append({"key": k, "verdict": "한쪽 없음", "equal": False}); continue
+        x = np.asarray(x); y = np.asarray(y)
+        if x.shape != y.shape:
+            rows.append({"key": k, "verdict": f"형상 {x.shape} vs {y.shape}", "equal": False}); continue
+        eq = bool(np.array_equal(x, y))
+        d = float(np.max(np.abs(x.astype(np.float64) - y.astype(np.float64)))) if x.size else 0.0
+        same += eq
+        rows.append({"key": k, "verdict": "동일" if eq else f"최대차 {d:.6g}",
+                     "equal": eq, "max_abs_diff": d})
+    return {"rows": rows, "identical": same, "total": len(pairs)}
+
+
+def compare_images(pa: Path, pb: Path, n: int = 50) -> dict:
+    """Sample-compare the image array. 이미지 배열을 표본으로 대조한다 (모수 병기)."""
+    za, zb = open_zarr(pa), open_zarr(pb)
+    if "camera0_rgb" not in za["data"] or "camera0_rgb" not in zb["data"]:
+        return {"scored": 0, "total": 0, "note": "camera0_rgb 없음 — 대조 불가. 통과가 아니다"}
+    A, B = za["data"]["camera0_rgb"], zb["data"]["camera0_rgb"]
+    if A.shape != B.shape:
+        return {"scored": 0, "total": 0, "note": f"형상 {A.shape} vs {B.shape} — 다르다"}
+    total = A.shape[0]
+    idx = np.unique(np.linspace(0, total - 1, min(n, total)).astype(int))
+    eq = sum(int(np.array_equal(np.asarray(A[i]), np.asarray(B[i]))) for i in idx)
+    return {"scored": eq, "total": int(len(idx)), "frames_total": int(total),
+            "note": "표본 프레임 중 완전 동일한 개수"}
 
 
 def main() -> None:
@@ -213,6 +273,9 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--zarr")
+    ap.add_argument("--compare", nargs=2, metavar=("A", "B"),
+                    help="두 zarr 의 배열 내용을 직접 대조한다 (해시가 아니라 값으로)")
+    ap.add_argument("--image-samples", type=int, default=50)
     ap.add_argument("--label", default=None, help="보고서에 적을 이름")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
@@ -223,8 +286,36 @@ def main() -> None:
     print("계측기 자체검증 먼저 —")
     if selftest():
         raise SystemExit("!! 자체검증 실패. 수치를 내지 않는다")
+    if a.compare:
+        pa, pb = (Path(x).expanduser() for x in a.compare)
+        da, ea = load_zarr(pa)
+        db, eb = load_zarr(pb)
+        cmp = compare_arrays(da, db, ea, eb)
+        print(f"\nA {pa}\nB {pb}\n")
+        for r in cmp["rows"]:
+            print(f"  {r['key']:28} {r['verdict']}")
+        print(f"\n포즈·개구 배열 동일 {cmp['identical']} / 전체 {cmp['total']}")
+        img = compare_images(pa, pb, a.image_samples)
+        if img["total"]:
+            print(f"이미지 표본 동일 {img['scored']} / 표본 {img['total']} "
+                  f"(전체 {img['frames_total']} 프레임)")
+        else:
+            print(f"이미지 대조 불가 — {img['note']}")
+        allsame = cmp["identical"] == cmp["total"] and img["total"] and img["scored"] == img["total"]
+        print("\n판정: " + ("같은 내용이다. 해시 차이는 재압축 때문이다 — A/B 가 아니다"
+                          if allsame else
+                          "내용이 다르다. 실제로 서로 다른 데이터다"))
+        if a.out:
+            Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+            Path(a.out).write_text(json.dumps(
+                {"a": str(pa), "b": str(pb), "arrays": cmp, "images": img,
+                 "identical_overall": bool(allsame)}, indent=2, ensure_ascii=False),
+                encoding="utf-8")
+            print(f"→ {a.out}")
+        return
+
     if not a.zarr:
-        ap.error("--zarr 가 필요하다")
+        ap.error("--zarr 또는 --compare 가 필요하다")
 
     p = Path(a.zarr).expanduser()
     data, ends = load_zarr(p)
