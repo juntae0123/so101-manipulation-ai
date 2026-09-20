@@ -22,6 +22,9 @@ PROFILE=$BUNDLE/03_umi_policy_trainer/configs/policy_resnet18_gpu.yaml
 TPY=python
 REPO=~/S15P21A103
 V10=~/S15P21A103_umi/AI/datasets/umi_real_relative_20260918_v10_orbslam_cadtcp_video_aligned_provisional_74ep
+# 변환기는 MuJoCo 태스크 설정으로 PickEnv 를 만든다 (--task 필수).
+# 2026-09-20 1차 실행이 이걸 안 넘겨 2단계에서 죽었다. 프리플라이트로 올린다.
+TASK=${TASK:-~/handoff/configs/can_side.yaml}
 OUT=$REPO/out/e2e_0920
 STAMP=$(date +%Y%m%d_%H%M%S)
 RUN_ID=${RUN_ID:-v10_real_74ep_$STAMP}
@@ -46,9 +49,11 @@ chk "감사기"          "test -f $REPO/AI/tools/audit_umi_zarr.py"
 chk "앵커 프로브"      "test -f $REPO/AI/tools/probe_chunk_anchor.py"
 chk "학습기"          "test -f $TRAINER"
 chk "학습 프로파일"    "test -f $PROFILE"
+chk "태스크 설정"      "test -f $TASK"
 echo "  프리플라이트 $ok / $tot"
+if [ ! -f "$TASK" ]; then echo "  -- ~/handoff/configs 안의 후보:"; ls ~/handoff/configs/*.yaml 2>/dev/null | head -20 || echo "     디렉터리 없음"; fi
 note "프리플라이트 $ok / $tot"
-[ "$ok" -lt 7 ] && { note "!! 필수 경로 누락. 중단"; echo "E2E_0920_FINISHED_MARKER"; exit 1; }
+[ "$ok" -lt 8 ] && { note "!! 필수 경로 누락. 중단"; echo "E2E_0920_FINISHED_MARKER"; exit 1; }
 
 say "0b. GPU 실연산 (가용성 확인 != 기능 확인)"
 CUDA_VISIBLE_DEVICES=$GPU $TPY - > "$OUT/gpu_check.txt" 2>&1 <<'PYEOF'
@@ -68,7 +73,7 @@ $PY "$REPO/AI/tools/probe_chunk_anchor.py" --dataset "$V10" --limit 0 --out "$OU
 grep -q '"status": "ANCHOR"' "$OUT/anchor.json" && note "앵커 ANCHOR 확인" || note "!! 앵커가 ANCHOR 가 아니다"
 
 say "2. v10 -> 공식 UMI zarr (train 분할)"
-$PY "$REPO/AI/tools/convert_v10_to_umi.py" --dataset "$V10" --out "$OUT/v10_train" --only train --holdout 14 --split-seed 42 2>&1 | tail -25
+$PY "$REPO/AI/tools/convert_v10_to_umi.py" --dataset "$V10" --task "$TASK" --out "$OUT/v10_train" --only train --holdout 14 --split-seed 42 2>&1 | tail -25
 ZARR=$OUT/v10_train.zarr.zip
 [ -f "$ZARR" ] || { note "!! 변환 실패. 중단"; echo "E2E_0920_FINISHED_MARKER"; exit 1; }
 note "변환 산출 $(stat -c%s "$ZARR") B"
