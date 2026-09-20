@@ -82,7 +82,7 @@ def audit(data: dict, ends: np.ndarray) -> dict:
 
     lens = [b - a for a, b in bounds]
     closures, rejected = [], []
-    paths, spans = [], []
+    paths, spans, ratios = [], [], []
     for a, b in bounds:
         try:
             g, _ = closure_gap_m(gap[a:b])
@@ -90,8 +90,11 @@ def audit(data: dict, ends: np.ndarray) -> dict:
         except ClosureNotFound as exc:
             rejected.append(str(exc))
         p = pos[a:b]
-        paths.append(float(np.linalg.norm(np.diff(p, axis=0), axis=1).sum()))
-        spans.append(float(np.linalg.norm(p.max(0) - p.min(0))))
+        pl = float(np.linalg.norm(np.diff(p, axis=0), axis=1).sum())
+        sp = float(np.linalg.norm(p.max(0) - p.min(0)))
+        paths.append(pl)
+        spans.append(sp)
+        ratios.append(pl / sp if sp > 1e-9 else float("inf"))
 
     nan_rows = int(np.sum(~np.isfinite(np.c_[pos, rot, gap[:, None]]).all(axis=1)))
     ang = np.linalg.norm(rot, axis=1)
@@ -115,6 +118,7 @@ def audit(data: dict, ends: np.ndarray) -> dict:
             "extent_m": (pos.max(0) - pos.min(0)).round(4).tolist(),
             "per_episode_span_median_m": float(np.median(spans)) if spans else None,
             "per_episode_path_median_m": float(np.median(paths)) if paths else None,
+            "path_span_ratio_median": float(np.median(ratios)) if ratios else None,
         },
         "rot_axis_angle": {"norm_min_rad": float(ang.min()), "norm_max_rad": float(ang.max()),
                            "over_pi": int(np.sum(ang > np.pi + 1e-6))},
@@ -122,6 +126,77 @@ def audit(data: dict, ends: np.ndarray) -> dict:
         "nonfinite_rows": nan_rows,
     }
     return out
+
+
+
+# ── 게이트 (현장 수집 판정) ──────────────────────────────────────────────────
+# ⚠️ 수집 **전에** 박은 값이다. 결과를 보고 옮기지 않는다.
+#    참조 집단: 현석 s22_pick_v3 35편 (120 epoch 학습이 돌아간 배치) 와 v4 76편.
+#    둘 다 통과하되 여유를 둔 선으로 잡았다. 못 맞추면 게이트를 낮추지 말고 다시 찍는다.
+GATES = {
+    "episodes_min":            {"v": 20,    "why": "1차 검증 표본. 단계식 수집 20 -> 검증 -> 100"},
+    "nonfinite_rows_max":      {"v": 0,     "why": "현석 두 배치 모두 0/16328, 0/3475"},
+    "closure_scored_rate_min": {"v": 1.0,   "why": "현석 76/76, 35/35. 닫힘이 안 잡히는 편은 학습에 못 쓴다"},
+    "closure_spread_mm_max":   {"v": 3.0,   "why": "현석 1.4mm · v4 1.6mm. 2배 여유"},
+    "episode_len_median_min":  {"v": 60,    "why": "30Hz 에서 2.0초. 너무 짧으면 접근이 안 담긴다"},
+    "episode_len_median_max":  {"v": 150,   "why": "30Hz 에서 5.0초. 현석 99(3.3초), v4 216(7.2초)은 길다"},
+    "path_span_ratio_max":     {"v": 2.5,   "why": "현석 1.63 · v4 2.90. 손을 덜 휘저어야 한다"},
+    "eef_extent_m_max":        {"v": 0.30,  "why": "SO-101 도달 반경 0.3m. 축별 폭이 이보다 크면 못 따라간다"},
+    "rot_span_rad_max":        {"v": 0.35,  "why": "현석 0.127 · v4 0.519. 접근 자세가 일정해야 5축으로 된다"},
+    "rate_hz_range":           {"v": [29.5, 30.5], "why": "현석 30.0021Hz. 표본율이 흔들리면 다운샘플이 깨진다"},
+}
+
+
+def evaluate_gates(r: dict, rate_hz: float | None = None, gates: dict | None = None) -> dict:
+    """Judge one audited dataset against pre-registered gates.
+    감사 결과를 사전 등록 게이트로 판정한다. 모수를 같이 낸다."""
+    g = {k: v["v"] for k, v in (gates or GATES).items()}
+    c, ep = r["closure"], r["eef_pos"]
+    rows = []
+
+    def row(name: str, ok: bool | None, got, want) -> None:
+        rows.append({"name": name, "ok": ok, "got": got, "want": want})
+
+    row("편 수", r["episodes"] >= g["episodes_min"], r["episodes"], f">= {g['episodes_min']}")
+    row("결측 행", r["nonfinite_rows"] <= g["nonfinite_rows_max"],
+        f"{r['nonfinite_rows']} / {r['frames']}", f"<= {g['nonfinite_rows_max']}")
+    rate = c["scored"] / c["total"] if c["total"] else 0.0
+    row("파지 닫힘 채점률", rate >= g["closure_scored_rate_min"],
+        f"{c['scored']} / {c['total']}", f">= {g['closure_scored_rate_min']:.0%}")
+    if c["median_mm"] is None:
+        row("파지 개구 폭", None, "닫힘 0편 — 대조 불가. 통과가 아니다",
+            f"<= {g['closure_spread_mm_max']} mm")
+    else:
+        sp = c["p90_mm"] - c["p10_mm"]
+        row("파지 개구 p10-p90 폭", sp <= g["closure_spread_mm_max"],
+            f"{sp:.2f} mm (중앙 {c['median_mm']:.1f})", f"<= {g['closure_spread_mm_max']} mm")
+    m = r["episode_len"]["median"] if r["episode_len"] else None
+    row("편 길이 중앙", None if m is None else
+        (g["episode_len_median_min"] <= m <= g["episode_len_median_max"]),
+        f"{m} 프레임" if m is not None else "없음",
+        f"{g['episode_len_median_min']}~{g['episode_len_median_max']}")
+    ratio = ep["path_span_ratio_median"]
+    row("경로/직선 비 중앙", None if ratio is None else ratio <= g["path_span_ratio_max"],
+        f"{ratio:.2f}" if ratio is not None else "없음", f"<= {g['path_span_ratio_max']}")
+    ext = max(ep["extent_m"])
+    row("EEF 축별 최대 폭", ext <= g["eef_extent_m_max"], f"{ext:.3f} m",
+        f"<= {g['eef_extent_m_max']} m")
+    rs = r["rot_axis_angle"]["norm_max_rad"] - r["rot_axis_angle"]["norm_min_rad"]
+    row("회전 크기 폭", rs <= g["rot_span_rad_max"], f"{rs:.3f} rad",
+        f"<= {g['rot_span_rad_max']} rad")
+    lo, hi = g["rate_hz_range"]
+    if rate_hz is None:
+        row("표본율", None, "미제공 — 대조 불가. 통과가 아니다 (--rate-hz)", f"{lo}~{hi} Hz")
+    else:
+        row("표본율", lo <= rate_hz <= hi, f"{rate_hz:.4f} Hz", f"{lo}~{hi} Hz")
+
+    passed = sum(1 for x in rows if x["ok"] is True)
+    failed = sum(1 for x in rows if x["ok"] is False)
+    unknown = sum(1 for x in rows if x["ok"] is None)
+    return {"rows": rows, "passed": passed, "failed": failed, "unknown": unknown,
+            "total": len(rows),
+            "verdict": "PASS" if failed == 0 and unknown == 0 else
+                       ("FAIL" if failed else "INCOMPLETE")}
 
 
 def _synth(n_ep: int = 5, ln: int = 40, closing: bool = True) -> tuple[dict, np.ndarray]:
@@ -192,6 +267,17 @@ def selftest() -> int:
     chk("9 1mm 차이를 잡아낸다 (판별행)",
         c_diff["identical"] == c_diff["total"] - 1,
         f"동일 {c_diff['identical']}/{c_diff['total']}")
+
+    # [10-12] 게이트 정답 아는 행
+    g_ok = evaluate_gates(audit(*_synth(n_ep=25, ln=100)), rate_hz=30.0)
+    chk("10 좋은 데이터 -> PASS", g_ok["verdict"] == "PASS",
+        f"통과 {g_ok['passed']}/{g_ok['total']} · {g_ok['verdict']}")
+    g_few = evaluate_gates(audit(*_synth(n_ep=5, ln=100)), rate_hz=30.0)
+    chk("11 편 5개 -> FAIL (판별행)", g_few["verdict"] == "FAIL",
+        f"불합격 {g_few['failed']} · {g_few['verdict']}")
+    g_nr = evaluate_gates(audit(*_synth(n_ep=25, ln=100)), rate_hz=None)
+    chk("12 표본율 미제공 -> INCOMPLETE (판별행)", g_nr["verdict"] == "INCOMPLETE",
+        "대조 불가가 통과로 나오면 안 된다")
 
     for nm, ok, note in log:
         print(f"  {'OK ' if ok else 'FAIL'}  {nm}" + (f"   {note}" if note else ""))
@@ -276,6 +362,9 @@ def main() -> None:
     ap.add_argument("--compare", nargs=2, metavar=("A", "B"),
                     help="두 zarr 의 배열 내용을 직접 대조한다 (해시가 아니라 값으로)")
     ap.add_argument("--image-samples", type=int, default=50)
+    ap.add_argument("--gate", action="store_true", help="사전 등록 게이트로 판정")
+    ap.add_argument("--rate-hz", type=float, default=None,
+                    help="원본 표본율. report json 의 native_sample_rate_hz")
     ap.add_argument("--label", default=None, help="보고서에 적을 이름")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
@@ -345,6 +434,18 @@ def main() -> None:
           f"{r['rot_axis_angle']['norm_max_rad']:.3f} rad · pi 초과 "
           f"{r['rot_axis_angle']['over_pi']}건")
     print(f"결측 행        {r['nonfinite_rows']} / {r['frames']}")
+
+    if a.gate:
+        gr = evaluate_gates(r, a.rate_hz)
+        print("\n── 사전 등록 게이트 ──────────────────────────────────")
+        for x in gr["rows"]:
+            mark = {True: "통과", False: "불합격", None: "미판정"}[x["ok"]]
+            print(f"  [{mark:^4}] {x['name']:<20} {str(x['got']):<34} 기준 {x['want']}")
+        print(f"\n  통과 {gr['passed']} · 불합격 {gr['failed']} · 미판정 {gr['unknown']} "
+              f"/ 전체 {gr['total']}")
+        print(f"  판정: {gr['verdict']}"
+              + ("   ← 미판정이 있으면 통과가 아니다" if gr["unknown"] else ""))
+        r["gates"] = gr
 
     if a.out:
         Path(a.out).parent.mkdir(parents=True, exist_ok=True)
