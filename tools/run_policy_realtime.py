@@ -339,12 +339,67 @@ def selftest() -> int:
 
     check("프레임 stride 기본값 = 실행 스텝 수 (시간축 일치)", ACTION_STEPS == 4,
           f"{ACTION_STEPS}")
+    # [14-16] bus.move() 경계 — mock publisher 로 **이 파일의** 전송 경계를 검사한다.
+    #         so101_infer 의 판별행은 그쪽 경계만 본다 (황도경 지적 2026-09-20).
+    class _Bus:
+        def __init__(self): self.calls = []
+        def move(self, i, t): self.calls.append((i, t))
+
+    class _RT:
+        JOINTS = [("j1", 1), ("j2", 2), ("j3", 3), ("j4", 4), ("j5", 5)]
+        GRIPPER = ("grip", 6)
+        @staticmethod
+        def preflight(qs, gaps, dt): return {"ok": True}
+        @staticmethod
+        def joint_to_tick(j, r): return int(2048 + r * 100)
+        @staticmethod
+        def gripper_to_tick(g): return int(1763 - g * 10000)
+
+    _plan = [(np.zeros(5), 0.05, 0.1, np.zeros(3)) for _ in range(4)]
+    b1 = _Bus(); n1, _ = emit_chunk(_plan, "프리플라이트 불합격", b1, _RT(), 0.0, False)
+    check("14 청크 거부 -> 전송 0회", n1 == 0 and len(b1.calls) == 0,
+        f"bus.move {len(b1.calls)}회")
+    b2 = _Bus(); n2, _ = emit_chunk(_plan, None, b2, _RT(), 0.0, False)
+    check("15 청크 통과 -> 전송 판별행", n2 == 4 and len(b2.calls) == 4 * 6,
+        f"{n2}점 · bus.move {len(b2.calls)}회 (기대 24)")
+    b3 = _Bus(); n3, _ = emit_chunk(_plan, None, b3, _RT(), 0.0, True)
+    check("16 dry-run -> 전송 0회", n3 == 0 and len(b3.calls) == 0, f"bus.move {len(b3.calls)}회")
+
 
     print(f"\n자체검증 {ok} / {total}")
     return 0 if ok == total else 1
 
 
 # ──────────────────────────────────────────────── 본체
+
+def emit_chunk(plan, chunk_reject, bus, rt, dt: float, dry_run: bool):
+    """Send a chunk only if the whole chunk passed. 청크 전체가 통과해야만 보낸다.
+
+    반환 (전송 횟수, 중단 사유). all-or-nothing 이다 — 초판은 웨이포인트별 즉시 전송이라
+    청크 후반이 실패해도 앞 점들이 이미 나갔다 (황도경 지적 2026-09-20).
+    이 함수가 run_policy_realtime -> bus.move() 경계 그 자체이고, 자체검사가 mock bus 로
+    **여기를** 검증한다. so101_infer 의 판별행은 그쪽 경계만 본다.
+    """
+    if chunk_reject is not None:
+        return 0, chunk_reject                      # 거부된 청크는 한 점도 안 나간다
+    if bus is None or dry_run:
+        return 0, None
+    sent = 0
+    for item in plan:
+        q_new, gap_new = item[0], item[1]
+        rrep = rt.preflight([list(q_new)], [gap_new], dt)
+        ok = True if rrep is None else (rrep.get("ok", False)
+                                        if isinstance(rrep, dict) else bool(rrep))
+        if not ok:
+            detail = rrep.get("fail") if isinstance(rrep, dict) else rrep
+            return sent, f"replay_trajectory preflight 불합격 {detail}"
+        for j, r in zip(rt.JOINTS, q_new):
+            bus.move(j[1], rt.joint_to_tick(j, r))
+        bus.move(rt.GRIPPER[1], rt.gripper_to_tick(gap_new))
+        sent += 1
+        time.sleep(dt)
+    return sent, None
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
@@ -362,6 +417,8 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="계산만. 서보에 아무것도 안 보낸다")
     ap.add_argument("--steps", type=int, default=40, help="재관측 횟수 상한")
     ap.add_argument("--action-steps", type=int, default=ACTION_STEPS)
+    ap.add_argument("--jaw-tol-deg", type=float, default=10.0,
+                    help="목표 자세와의 측지각 허용치[도]. policy_to_joints 기본값과 같다")
     ap.add_argument("--jaw-offset-deg", type=float, default=0.0)
     ap.add_argument("--frame-stride", type=int, default=None,
                     help="재관측 1회당 넘길 프레임 수. 기본 = --action-steps. "
@@ -440,25 +497,26 @@ def main() -> None:
     #    누락·null·NaN 이면 버스를 열기 전에 죽는다 (fail-closed).
     #    초판은 이 경로에 상한이 아예 없어서, 현석 실물 로그의 wrist_roll -150.4도와
     #    arm_delta -1784(300틱 초과)를 우리 러너는 한 번도 검사하지 않았다.
-    MAX_STEP_RAD = WRIST_ROLL_MIN_RAD = WRIST_ROLL_MAX_RAD = None
-    MAX_STEP_TICK = WRIST_ROLL_INDEX = None
-    WAYPOINT_DT_S = 1.0 / 10.0                  # 공칭. --dt 로 덮을 수 있게 아래서 갱신
-    if not a.no_robot and not a.dry_run:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "deploy"))
-        from so101_infer import load_safety, SafetyUnset
-        from so101_infer import WRIST_ROLL_INDEX as _WRI
-        try:
-            _SF = load_safety()
-        except SafetyUnset as exc:
+    # ⚠️ 안전 임계값은 이 파일에서 정하지 않는다. so101_infer 의 설정에서만 읽는다.
+    #    2026-09-20 2차 정정 — 초판은 이 로딩을 `not no_robot and not dry_run` 안에 두어
+    #    dry-run 에서 상수가 None 인 채로 비교에 들어가 TypeError 가 났다 (황도경 지적).
+    #    이제 **항상** 시도한다. 실패하면 실물 전송은 죽고, dry-run 은 "판정 불가"로 돈다 —
+    #    "검사 안 함"이 "통과"로 보이지 않게 한다.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "deploy"))
+    from so101_infer import load_safety, SafetyUnset, preflight as si_preflight
+    SAFETY = None
+    try:
+        SAFETY = load_safety()
+        print(f"안전 설정 로드: 임계 {len(SAFETY)}개 · "
+              f"스텝 {int(SAFETY['max_step_tick'])}틱 · "
+              f"속도 {SAFETY['max_joint_speed_rad_s']} rad/s · "
+              f"여유 {SAFETY['min_joint_margin_deg']}도 · "
+              f"wrist_roll [{math.degrees(SAFETY['wrist_roll_min_rad']):.1f}, "
+              f"{math.degrees(SAFETY['wrist_roll_max_rad']):.1f}]도")
+    except SafetyUnset as exc:
+        if not a.no_robot and not a.dry_run:
             raise SystemExit(f"!! 안전 설정 미확정 — 실물 전송을 시작하지 않는다.\n{exc}")
-        MAX_STEP_RAD = _SF["max_step_rad"]
-        MAX_STEP_TICK = int(_SF["max_step_tick"])
-        WRIST_ROLL_MIN_RAD = _SF["wrist_roll_min_rad"]
-        WRIST_ROLL_MAX_RAD = _SF["wrist_roll_max_rad"]
-        WRIST_ROLL_INDEX = _WRI
-        print(f"안전 설정 로드: 스텝 {MAX_STEP_TICK}틱({math.degrees(MAX_STEP_RAD):.2f}도) · "
-              f"wrist_roll [{math.degrees(WRIST_ROLL_MIN_RAD):.1f}, "
-              f"{math.degrees(WRIST_ROLL_MAX_RAD):.1f}]도")
+        print(f"⚠️ 안전 설정 미확정 — 이번 실행의 안전 판정은 **판정 불가**다. 통과가 아니다.\n{exc}")
 
     bus = None
     if not a.no_robot:
@@ -470,7 +528,16 @@ def main() -> None:
         if okn < len(rt.JOINTS):
             bus.close(); raise SystemExit(f"!! 관절 {okn}/{len(rt.JOINTS)} 만 읽힌다. 중단")
         q_cur = np.asarray(q_meas, float)
-        gap_cur = 0.09 if g_meas is None else float(g_meas)
+        # ⚠️ 2026-09-20 정정 — 초판은 g_meas 가 None 이면 0.09(완전 열림)로 **지어냈다.**
+        #    위 건전성 검사는 팔 관절만 세므로 그리퍼 읽기 실패가 걸리지 않았고,
+        #    그 값이 observe() 를 타고 정책 관측(robot0_gripper_width)으로 들어갔다.
+        #    실제로는 물체를 쥐고 있는데 정책은 "아직 안 쥐었다"로 보고 접근을 다시 낸다.
+        #    "못 읽었다"와 "열려 있다"가 같은 값이 되면 안 된다.
+        if g_meas is None:
+            bus.close()
+            raise SystemExit("!! 그리퍼 폭을 못 읽었다. 이 값은 정책 관측으로 들어가므로 "
+                             "추측값으로 대체하지 않는다. 서보 응답을 먼저 확인해라")
+        gap_cur = float(g_meas)
         print(f"[로봇] 현재 자세 읽음 · gap {gap_cur * 1000:.1f} mm")
         if not (a.dry_run or a.yes):
             if input("팔 주변을 비웠나? 진행하려면 'go': ").strip() != "go":
@@ -534,71 +601,80 @@ def main() -> None:
                 pred_gap = float(np.clip(absolute[1][6], 0.0, 0.09))
                 gap_track.append((cam.last, gt_gap * 1000, pred_gap * 1000))
 
+            # ⚠️ 2026-09-20 2차 정정 (황도경 검토) — 초판 구조가 **웨이포인트별 즉시 전송**
+            #    이라 청크 후반이 실패해도 앞 점들은 이미 나간 뒤였다. 그리고 안전 설정
+            #    7개 중 max_step_tick·wrist_roll 만 실제로 검사하고 speed·joint_margin·
+            #    min_tcp_z·ik_tol 은 읽기만 했다.
+            #    → 4점을 **전부 먼저 풀고**, so101_infer.preflight 로 청크 통째로 검사한다.
+            #      하나라도 불합격이면 그 청크의 전송은 0회다 (all-or-nothing).
+            #      같은 함수를 쓰므로 설정 7개가 자동으로 전부 적용된다 — 오프라인 어댑터와
+            #      받는 쪽이 **같은 자**를 쓴다.
+            plan, chunk_reject = [], None
+            q_walk = q_cur.copy()
             for target in absolute[1:1 + a.action_steps]:
-                T_now = fk(q_cur)
+                T_now = fk(q_walk)
                 pos = clamp_target(target[:3], T_now[:3, 3])
                 Rm = p2j.apply_jaw_offset(
                     Rotation.from_rotvec(target[3:6]).as_matrix(), a.jaw_offset_deg)
                 try:
-                    q_new = env.ik(pos, Rm, seed=q_cur, strict=False)
+                    q_new = env.ik(pos, Rm, seed=q_walk, strict=False)
                 except Exception as exc:                # noqa: BLE001
-                    print(f"  [{it}] IK 예외 {type(exc).__name__} — 이 스텝 건너뜀")
-                    rejected += 1                       # R6: 초판은 이걸 안 셌다
-                    continue
+                    chunk_reject = f"IK 예외 {type(exc).__name__}"
+                    break
                 if q_new is None:
-                    print(f"  [{it}] IK 해 없음 — 건너뜀")
-                    rejected += 1                       # R6: 초판은 이걸 안 셌다
-                    continue
+                    chunk_reject = "IK 해 없음"
+                    break
                 Tc = fk(q_new)
                 res = float(np.linalg.norm(Tc[:3, 3] - pos))
                 if a.ik_reject_mm is not None and res * 1000 > a.ik_reject_mm:
-                    print(f"  [{it}] IK 잔차 {res * 1000:.1f}mm > {a.ik_reject_mm:.0f}mm — 건너뜀")
-                    rejected += 1
-                    continue
+                    chunk_reject = f"IK 잔차 {res * 1000:.1f}mm > {a.ik_reject_mm:.0f}mm"
+                    break
                 gap_new = float(np.clip(target[6], 0.0, 0.09))
+                # ⚠️ R3 (2026-09-20) — policy_to_joints.solve_waypoints 가 웨이포인트마다
+                #    거는 측지각 검사가 실물 경로에는 없었다. 자세가 얼마나 틀어졌는지
+                #    보지 않고 보내면, 파지 여유 ±25mm 인 계에서 확정적으로 빗나간다.
+                e_rot = float(np.degrees(np.arccos(np.clip(
+                    (np.trace(Tc[:3, :3].T @ Rm) - 1.0) / 2.0, -1.0, 1.0))))
+                if e_rot > a.jaw_tol_deg:
+                    chunk_reject = f"자세 측지각 {e_rot:.2f}도 > {a.jaw_tol_deg:.1f}도"
+                    break
+                plan.append((np.asarray(q_new, float), gap_new, res * 1000.0, pos))
+                q_walk = np.asarray(q_new, float)
 
-                # ⚠️ 2026-09-20 정정 (황도경 검토) — 초판은 여기서 세 가지가 뚫려 있었다.
-                #  R1 preflight 를 **문(statement)으로만** 부르고 반환값을 안 봤다.
-                #     관절한계 밖이어도 바로 다음 줄에서 조건 없이 bus.move 가 나갔다.
-                #  R2 웨이포인트를 1개씩 넘겨서 연속 두 점의 차분을 보는 max_step·speed
-                #     검사가 구조적으로 checked=0 이 됐다. 게다가 4개를 대기 없이 연속
-                #     전송하므로 서보는 **마지막 목표만** 추종한다 — 0.1초 간격 4번의
-                #     35mm 가 아니라 최대 140mm 한 번의 점프가 된다.
-                #  → 관절 공간 스텝 상한을 여기서 직접 걸고, 전송 후 dt 만큼 기다린다.
-                step_rad = float(np.max(np.abs(np.asarray(q_new, float) - q_cur)))
-                if step_rad > MAX_STEP_RAD + 1e-9:
-                    print(f"  [{it}] 관절 스텝 {math.degrees(step_rad):.2f}도 > "
-                          f"{math.degrees(MAX_STEP_RAD):.2f}도 ({MAX_STEP_TICK}틱) — 전송 거부")
-                    rejected += 1
-                    continue
-                wr = float(q_new[WRIST_ROLL_INDEX])
-                if not (WRIST_ROLL_MIN_RAD <= wr <= WRIST_ROLL_MAX_RAD):
-                    print(f"  [{it}] wrist_roll {math.degrees(wr):.1f}도 가 실물 범위 "
-                          f"[{math.degrees(WRIST_ROLL_MIN_RAD):.0f}, "
-                          f"{math.degrees(WRIST_ROLL_MAX_RAD):.0f}]도 밖 — 전송 거부")
-                    rejected += 1
-                    continue
+            if chunk_reject is None and not plan:
+                chunk_reject = "경유점 0개"
 
-                if bus is not None and not a.dry_run:
-                    import replay_trajectory as rt
-                    rep = rt.preflight([list(q_new)], [gap_new])
-                    # 반환값 규약이 무엇이든 "통과 아님"이면 안 보낸다. dict 면 ok 키를,
-                    # 그 외에는 falsy 여부를 본다. None 만 "검사 없음"으로 통과시킨다.
-                    ok = True if rep is None else (rep.get("ok", False)
-                                                   if isinstance(rep, dict) else bool(rep))
-                    if not ok:
-                        detail = rep.get("fail") if isinstance(rep, dict) else rep
-                        print(f"  [{it}] preflight 불합격 {detail} — 전송 거부")
-                        rejected += 1
-                        continue
-                    for j, r in zip(rt.JOINTS, q_new):
-                        bus.move(j[1], rt.joint_to_tick(j, r))
-                    bus.move(rt.GRIPPER[1], rt.gripper_to_tick(gap_new))
-                    sent += 1
-                    time.sleep(WAYPOINT_DT_S)   # R2: 서보가 이 점을 실제로 지나게 둔다
-                q_cur, gap_cur = np.asarray(q_new, float), gap_new
-                log.append({"iter": it, "pos": pos.tolist(), "gap_m": gap_new,
-                            "q": [float(v) for v in q_new], "ik_residual_m": res})
+            # 청크 전체 프리플라이트. 현재 자세를 맨 앞에 붙여야 첫 점의 스텝·속도도 잰다.
+            rep = None
+            if chunk_reject is None and SAFETY is not None:
+                qs_chunk = [q_cur] + [pp[0] for pp in plan]
+                gs_chunk = [gap_cur] + [pp[1] for pp in plan]
+                rs_chunk = [0.0] + [pp[2] for pp in plan]
+                rep = si_preflight(qs_chunk, gs_chunk, a.dt, rs_chunk, SAFETY)
+                if not rep["ok"]:
+                    chunk_reject = "프리플라이트 불합격 " + " · ".join(rep["fail"])
+            elif chunk_reject is None and SAFETY is None:
+                chunk_reject = ("안전 설정 미확정 — 검사할 자가 없다. "
+                                "이 청크는 '통과'가 아니라 '판정 불가'다")
+
+            _rt = None
+            if bus is not None and not a.dry_run:
+                import replay_trajectory as _rt
+            ns, halt = emit_chunk(plan, chunk_reject, bus, _rt, a.dt, a.dry_run)
+            sent += ns
+            if chunk_reject is not None:
+                print(f"  [{it}] 청크 거부 ({len(plan)}/{a.action_steps} 점 계산됨) — {chunk_reject}")
+                print(f"        → 이 청크 전송 0회")
+                rejected += max(1, len(plan))
+            else:
+                if halt:
+                    print(f"  [{it}] {halt} — {ns}/{len(plan)} 점에서 중단")
+                    rejected += 1
+                for q_new, gap_new, res_mm, pos in plan[:ns or len(plan)]:
+                    q_cur, gap_cur = q_new, gap_new
+                    log.append({"iter": it, "pos": pos.tolist(), "gap_m": gap_new,
+                                "q": [float(v) for v in q_new], "ik_residual_m": res_mm / 1000.0,
+                                "preflight_ok": True})
 
             stride = a.frame_stride if a.frame_stride is not None else a.action_steps
             nxt = None
@@ -613,7 +689,13 @@ def main() -> None:
             hist.append(observe(nxt))
             hist = hist[-2:]
             if bus is not None and not a.dry_run:
-                time.sleep(0.4)          # 재관측 주기 (실행 4스텝 × 0.1초)
+                # ⚠️ 웨이포인트마다 a.dt 를 이미 기다린다. 여기서 또 0.4초를 자면
+                #    재관측 주기가 0.8초가 된다 (황도경 지적 2026-09-20).
+                #    실제로 실행한 시간만큼만 보정한다.
+                spent = len(plan) * a.dt if not chunk_reject else 0.0
+                remain = max(0.0, a.action_steps * a.dt - spent)
+                if remain > 0:
+                    time.sleep(remain)
     except KeyboardInterrupt:
         print("\n!! 중단됨")
     finally:
