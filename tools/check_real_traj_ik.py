@@ -289,7 +289,7 @@ def check_episode(env, chain: np.ndarray, T_base_home: np.ndarray, limits: dict,
             seed = q
             # [joint_margin_patch] 한계까지 남은 여유를 관절별로 적재한다.
             #    통과 여부만으로는 아슬아슬한 편과 여유 있는 편이 구분되지 않는다.
-            margins.append(np.minimum(np.asarray(q) - qlo, qhi - np.asarray(q)))
+            margins.append(np.minimum(np.asarray(q) - q_lo, q_hi - np.asarray(q)))
         else:
             qs.append(None)
             if first_fail is None:
@@ -357,8 +357,8 @@ def _margin_block(margins: list, n_waypoints: int) -> dict:
     """Summarize per-joint distance to the nearest joint limit, in degrees.
     관절별 한계까지 남은 여유를 도 단위로 요약한다.
 
-    IK 가 한 번도 안 풀린 편은 여유를 잴 수 없다. 그 경우 값을 None 으로 두되
-    사유를 같이 실어서, '여유 없음' 과 '여유 못 쟀음' 이 같은 출력이 되지 않게 한다.
+    IK 가 한 번도 안 풀린 편은 여유를 잴 수 없다. 값은 None 으로 두되 사유를 같이 실어서
+    '여유 없음' 과 '여유 못 쟀음' 이 같은 출력이 되지 않게 한다.
     """
     scored = len(margins)
     if scored == 0:
@@ -370,7 +370,7 @@ def _margin_block(margins: list, n_waypoints: int) -> dict:
             "tightest_joint_index": None,
             "margin_unmeasured_reason": "no_successful_ik — 여유를 못 쟀다. 여유가 넉넉한 것이 아니다",
         }
-    M = np.degrees(np.stack(margins))              # (scored, n_joints)
+    M = np.degrees(np.stack(margins))
     per_joint = M.min(axis=0)
     j = int(np.argmin(per_joint))
     return {
@@ -598,17 +598,14 @@ def main() -> None:
     def margin_summary(results: list) -> None:
         scored = [r for r in results if r.get("joint_margin_min_overall_deg") is not None]
         unscored = len(results) - len(scored)
-        print(f"\n관절 여유 — 잰 편 {len(scored)}/{len(results)}"
-              f" (못 잰 편 {unscored}: IK 전무)")
+        print(f"\n관절 여유 — 잰 편 {len(scored)}/{len(results)} (못 잰 편 {unscored}: IK 전무)")
         if not scored:
             print("  ⚠️ 한 편도 못 쟀다. 여유가 넉넉한 것이 아니라 계측이 안 된 것이다")
             return
         vals = sorted(r["joint_margin_min_overall_deg"] for r in scored)
         for thr in (1.0, 5.0, 10.0):
-            n = sum(1 for v in vals if v < thr)
-            print(f"  여유 {thr:4.1f}도 미만  {n}/{len(scored)}편")
-        mid = vals[len(vals) // 2]
-        print(f"  최소 {vals[0]:.2f}도 · 중앙 {mid:.2f}도 · 최대 {vals[-1]:.2f}도")
+            print(f"  여유 {thr:4.1f}도 미만  {sum(1 for v in vals if v < thr)}/{len(scored)}편")
+        print(f"  최소 {vals[0]:.2f}도 · 중앙 {vals[len(vals) // 2]:.2f}도 · 최대 {vals[-1]:.2f}도")
         from collections import Counter
         c = Counter(r["tightest_joint_index"] for r in scored)
         print("  가장 빡빡한 관절: " + " · ".join(
@@ -676,6 +673,7 @@ def main() -> None:
     if skipped:
         print(f"!! 건너뛴 {len(skipped)}편: {skipped[:3]}")
     print("거부 사유:", reason_counts if reason_counts else "없음")
+    margin_summary(results)                       # [joint_margin_patch]
     print(f"→ {a.out}")
     print("⚠️ simulation-only episode-start alignment 기준이다. 실물 캘리브레이션이 아니다.")
 
