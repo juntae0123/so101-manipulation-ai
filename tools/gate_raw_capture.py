@@ -152,6 +152,9 @@ def measure_episode(d: Path) -> dict:
     return r
 
 
+UNKNOWN = object()          # 키 자체가 없을 때. None(=없음) 과 구분한다
+
+
 def judge(r: dict, gates: dict | None = None) -> dict:
     """Apply gates. 게이트를 건다. 값이 없으면 미판정이지 통과가 아니다."""
     g = {k: v["v"] for k, v in (gates or GATES).items()}
@@ -200,8 +203,13 @@ def judge(r: dict, gates: dict | None = None) -> dict:
         row(f"{ko} 프레임 구간 덮음", None if mv is None else mv >= g["imu_margin_s_min"],
             "없음 — 대조 불가" if mv is None else f"{mv:+.3f}s", f">= {g['imu_margin_s_min']}s")
     under("pts/센서 시각차 ms", r.get("pts_skew_ms_max"), g["pts_skew_ms_max"])
-    row("영상 파일", r.get("video_bytes") is not None,
-        f"{r.get('video_bytes')} B" if r.get("video_bytes") else "없음", "있을 것")
+    # ⚠️ "없다"와 "모른다"를 가른다. 서비스 경로(gate_api)는 영상을 안 받으므로
+    #    크기를 안 주면 **미판정**이지 불합격이 아니다. 폴더 경로에선 없으면 불합격이다.
+    _vb = r.get("video_bytes", UNKNOWN)
+    if _vb is UNKNOWN or _vb == "미지정":
+        row("영상 파일", None, "크기 미지정 — 대조 불가", "있을 것")
+    else:
+        row("영상 파일", _vb is not None, f"{_vb} B" if _vb else "없음", "있을 것")
 
     # 판정은 **필수 항목만** 본다. 권고는 따로 센다 — 섞으면 길다는 이유로 전 편이 날아간다
     hard = [x for x in rows if not x["soft"]]
@@ -283,6 +291,14 @@ def selftest() -> int:
             f"{lng['verdict']} · 권고 미충족 {lng['soft_unmet']}/{lng['soft_total']}")
         _write_synth(root, "rec_50", frames=50)
         shrt2 = judge(measure_episode(root / "rec_50"))
+        _g = dict(good); _g.pop("video_bytes", None)        # 크기를 **안 알려준** 경우
+        _ju = judge(_g)
+        chk("3d 영상 크기 미지정 -> 미판정, PASS 아님 (판별행)",
+            _ju["verdict"] == "INCOMPLETE" and _ju["unknown"] == 1,
+            f"{_ju['verdict']} · 미판정 {_ju['unknown']}")
+        _g2 = dict(good); _g2["video_bytes"] = None         # 영상이 **없는** 경우
+        chk("3e 영상 없음 -> 불합격 (미판정과 갈린다)",
+            judge(_g2)["verdict"] == "FAIL", judge(_g2)["verdict"])
         chk("3c 50프레임 -> 하한 필수 불합격 (판별행)",
             shrt2["verdict"] == "FAIL", shrt2["verdict"])
 
