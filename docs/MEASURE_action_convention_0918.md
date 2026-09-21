@@ -87,7 +87,7 @@ Jetson 추론 코드가 함수 이름만 알고 인자를 안 넘기면 기본�
 |---|---|---|
 | `dim` | 10 | shape_meta `action.shape [10]` · 소스 `//10` |
 | `horizon` | 8 | cfg 7군데 일치, 불일치 0 |
-| `rateHz` | 10 (공칭) | v10 원본 간격 불균일 — `observation_timestamp` 가 실제 시각 |
+| `rateHz` | 10 (공칭) | 실제 시각은 `observation_timestamp` — **정정 2026-09-21**: "간격 불균일" 은 틀렸다. 0918 v10 74편·차분 4640개 전부 step=3 |
 | `dx,dy,dz` | 상대 | `action_pose_repr = relative` |
 | `rotation` | 회전행렬 첫 두 **행** | 스윕 4후보 중 오차 0 유일 |
 | `compose` | `T_next = T_cur @ A_relative` | `pose_repr_util.py:62` |

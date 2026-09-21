@@ -56,6 +56,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 ACTION_STEPS = 4                 # evaluate.py 기본값. index [1, 1+4)
+DT_S = 0.1                       # 웨이포인트 주기[초]. v10 표본 10Hz 기준
 MAX_STEP_M = 0.035               # evaluate.py 의 컨트롤러 상한. 한 번에 이만큼만 움직인다
 Z_CLIP = (0.006, 0.40)
 
@@ -365,6 +366,49 @@ def selftest() -> int:
     b3 = _Bus(); n3, _ = emit_chunk(_plan, None, b3, _RT(), 0.0, True)
     check("16 dry-run -> 전송 0회", n3 == 0 and len(b3.calls) == 0, f"bus.move {len(b3.calls)}회")
 
+    # [17] 후반 웨이포인트가 거부되면 **앞부분도** 안 나가야 한다 (황도경 지적 2026-09-21).
+    #      초판은 웨이포인트마다 preflight -> move 라 3번째가 걸려도 앞 2개는 이미 나갔다.
+    class _RT3(_RT):
+        n = 0
+        @classmethod
+        def preflight(cls, qs, gaps, dt):
+            cls.n += 1
+            return {"ok": cls.n != 3, "fail": ["3번째 고의 불량"]}
+
+    _RT3.n = 0
+    b4 = _Bus(); n4, why4 = emit_chunk(_plan, None, b4, _RT3(), 0.0, False)
+    check("17 3번째 거부 -> 전송 0회 (판별행)",
+          n4 == 0 and len(b4.calls) == 0,
+          f"{n4}점 · bus.move {len(b4.calls)}회 (기대 0) · {why4}")
+
+    # [18] 틱 변환이 터져도 전송 0회여야 한다
+    class _RTx(_RT):
+        @staticmethod
+        def gripper_to_tick(g): raise ValueError("고의 예외")
+
+    b5 = _Bus(); n5, why5 = emit_chunk(_plan, None, b5, _RTx(), 0.0, False)
+    check("18 틱 변환 예외 -> 전송 0회 (판별행)",
+          n5 == 0 and len(b5.calls) == 0, f"bus.move {len(b5.calls)}회 · {why5}")
+
+    # [19] main 이 쓰는 인자가 전부 파서에 정의돼 있는가. --dt 누락이 여기서 잡힌다.
+    #      자체검사가 main 진입 전에 끝나 AttributeError 를 못 잡았다 (황도경 지적 2026-09-21).
+    import inspect as _insp
+    import re as _re
+    try:
+        _src = _insp.getsource(main)
+        _used = sorted(set(_re.findall(r"\ba\.([a-z_][a-z0-9_]*)", _src)))
+        _have = set(vars(build_parser().parse_args([])))
+        _missing = [u for u in _used if u not in _have]
+        check("19 main 이 쓰는 인자가 전부 정의됨",
+              not _missing,
+              f"대조 {len(_used) - len(_missing)} / {len(_used)}"
+              + (f"  누락 {_missing}" if _missing else ""))
+        # 판별행 — 없는 이름을 넣으면 반드시 잡혀야 한다
+        check("19b 없는 인자를 넣으면 잡힌다 (판별행)",
+              "nonexistent_flag" not in _have, "검사가 무조건 통과하면 검사가 아니다")
+    except Exception as _e:                                   # noqa: BLE001
+        check("19 main 인자 대조", False, f"대조 불가 {type(_e).__name__}: {_e}")
+
 
     print(f"\n자체검증 {ok} / {total}")
     return 0 if ok == total else 1
@@ -384,7 +428,12 @@ def emit_chunk(plan, chunk_reject, bus, rt, dt: float, dry_run: bool):
         return 0, chunk_reject                      # 거부된 청크는 한 점도 안 나간다
     if bus is None or dry_run:
         return 0, None
-    sent = 0
+
+    # ── 1단계: 검사와 틱 변환만. **bus 를 건드리지 않는다** ──────────────────
+    # ⚠️ 2026-09-21 2차 정정 (황도경 지적) — 초판은 웨이포인트마다 preflight 를 부르고
+    #    곧바로 move 했다. 그러면 3번째가 거부돼도 앞 2개는 이미 서보로 나간 뒤다.
+    #    청크 전체를 먼저 통과시킨 다음에야 첫 move 를 부른다.
+    frames = []
     for item in plan:
         q_new, gap_new = item[0], item[1]
         rrep = rt.preflight([list(q_new)], [gap_new], dt)
@@ -392,16 +441,27 @@ def emit_chunk(plan, chunk_reject, bus, rt, dt: float, dry_run: bool):
                                         if isinstance(rrep, dict) else bool(rrep))
         if not ok:
             detail = rrep.get("fail") if isinstance(rrep, dict) else rrep
-            return sent, f"replay_trajectory preflight 불합격 {detail}"
-        for j, r in zip(rt.JOINTS, q_new):
-            bus.move(j[1], rt.joint_to_tick(j, r))
-        bus.move(rt.GRIPPER[1], rt.gripper_to_tick(gap_new))
+            return 0, f"replay_trajectory preflight 불합격 {detail}"   # 전송 0회
+        try:
+            ticks = [(j[1], rt.joint_to_tick(j, r)) for j, r in zip(rt.JOINTS, q_new)]
+            ticks.append((rt.GRIPPER[1], rt.gripper_to_tick(gap_new)))
+        except Exception as exc:                    # noqa: BLE001
+            return 0, f"틱 변환 예외 {type(exc).__name__}: {exc}"        # 전송 0회
+        frames.append(ticks)
+
+    # ── 2단계: 여기서부터 실제 전송. 청크 전체가 이미 통과했다 ────────────────
+    sent = 0
+    for ticks in frames:
+        for idx, t in ticks:
+            bus.move(idx, t)
         sent += 1
         time.sleep(dt)
     return sent, None
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """CLI parser. main 과 자체검사가 **같은 파서**를 본다.
+    초판은 파서가 main 안에 있어 자체검사가 --dt 누락을 못 잡았다 (황도경 지적 2026-09-21)."""
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--selftest", action="store_true")
@@ -434,6 +494,14 @@ def main() -> None:
                          "팔 상태와 화면이 갈리지 않아 **정책이 닫는지**를 순수하게 본다. "
                          "제어를 재는 게 아니라 정책 출력을 재는 모드다")
     ap.add_argument("--yes", action="store_true")
+    ap.add_argument("--dt", type=float, default=DT_S,
+                    help="웨이포인트 주기[초]. 기본 %(default)s (v10 표본 10Hz)")
+    return ap
+
+
+def main() -> None:
+    """CLI entry point. 명령행 진입점."""
+    ap = build_parser()
     a = ap.parse_args()
 
     if a.selftest:

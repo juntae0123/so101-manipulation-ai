@@ -165,7 +165,9 @@ def build_manifest(cfg, n_params: int, src: Path, out: Path,
             "horizon": at(cfg, "shape_meta.action.horizon"),
             "n_action_steps": at(cfg, "n_action_steps"),
             "rateHz": 10,
-            "rateHz_note": "공칭이다. v10 원본 간격이 불균일하므로 0.1초 고정 가정 금지",
+            "rateHz_note": ("공칭이다. 0918 v10 74편·차분 4640개는 전부 source_row step=3 "
+                            "으로 확정됐다(2026-09-21). 그래도 0.1초 고정 가정은 하지 말고 "
+                            "실제 시각은 observation_timestamp 에서 읽어라"),
             "layout": {"0:3": "dx,dy,dz (m, 상대)",
                        "3:9": "rot6d",
                        "9": "gap (m, 절대)"},

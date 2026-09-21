@@ -28,7 +28,9 @@ ACTION_DIM = 10
 ACTION_HORIZON = 8
 EXEC_SLICE = (1, 5)              # execSlice. cfg 값이 아니라 실행측 선택이다
 ROT6D_ROWS = True                # "회전행렬의 첫 두 행. 열이 아니다"
-NOMINAL_RATE_HZ = 10.0           # 공칭. v10 원본 간격 불균일 — 0.1초 고정 가정 금지
+NOMINAL_RATE_HZ = 10.0           # 공칭. 실제 시각은 observation_timestamp 에서 읽는다.
+#  ⚠️ 정정 2026-09-21 — "간격 2·3 혼재" 는 틀렸다. 0918 v10 74편·차분 4640개 전부 source_row step=3 으로 확정 (2026-09-21, 황도경).
+#     그래도 0.1초를 고정으로 가정하지 않는다: 배치가 바뀌면 다시 재고 쓴다
 GAP_RANGE_M = (0.0, 0.09)
 ACTION_POSE_REPR = "relative"    # 기본값 'abs'. 안 넘기면 상대를 절대로 읽는다
 

@@ -406,7 +406,9 @@ def main() -> None:
         #  (2) uniform 을 np.allclose(dv, dv[0]) 로 봤다. 첫 간격 하나에 전부를 건다.
         #      중앙값 대비 상대편차로 바꾼다.
         #  observation_timestamp(관측 시각)와 source_row(원본 30fps 프레임 인덱스)는
-        #  **다른 축이다.** "간격 2·3 혼재"는 source_row 쪽 이야기다. 둘 다 잰다.
+        #  **다른 축이다.** source_row 쪽 이야기다. 둘 다 잰다.
+        #  ⚠️ 정정 2026-09-21 (황도경) — source_row 도 "2·3 혼재" 가 아니다.
+        #     0918 v10 74편·차분 4640개 전부 step=3 이다. 그래도 고정 가정은 안 한다.
         ts_stat = {"episode": name}
         for key in ("observation_timestamp", "source_row"):
             if key not in getattr(z, "files", []):

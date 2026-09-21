@@ -193,7 +193,8 @@ def step_durations(z, n_steps: int) -> np.ndarray:
     """Real seconds between consecutive waypoints, from recorded timestamps.
     웨이포인트 사이 실제 초. 기록된 타임스탬프에서 읽는다.
 
-    ⚠️ `source_row` 간격이 균일하지 않다(3 과 2 가 섞인다). 0.1초 고정으로
+    ⚠️ 정정 2026-09-21 — "3 과 2 가 섞인다"는 틀렸다. 0918 v10 74편·차분 4640개 전부 source_row step=3 으로 확정 (2026-09-21, 황도경).
+       그래도 0.1초를 고정으로 쓰지 않는다. 0.1초 고정으로
     계산하면 속도가 최대 1.5배 어긋난다. 고정값을 쓰지 않는다."""
     ot = np.asarray(z["observation_timestamp"], dtype=np.float64)
     cur = ot[:, -1]                       # 각 행의 현재 관측 시각
