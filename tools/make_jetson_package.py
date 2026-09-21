@@ -176,6 +176,13 @@ def verify(out: Path, archive: Path | None) -> dict:
 
 def build(run_dir: Path, dataset_report: Path, exporter: Path, umi_root: Path,
           out_root: Path, python: str) -> int:
+    # ⚠️ 변환기를 cwd=work 에서 돌린다. 상대경로를 넘기면 work 기준으로 찾아서
+    #    FileNotFoundError 가 난다 (2026-09-21 실증). **전부 절대경로로 못 박는다.**
+    run_dir = run_dir.resolve()
+    dataset_report = dataset_report.resolve()
+    exporter = exporter.resolve()
+    umi_root = umi_root.resolve()
+    out_root = out_root.expanduser().resolve()
     ck = run_dir / "checkpoints" / "best.ckpt"
     man = run_dir / "deploy"
     manifests = sorted(man.glob("*.manifest.json")) if man.is_dir() else []
@@ -214,9 +221,13 @@ def build(run_dir: Path, dataset_report: Path, exporter: Path, umi_root: Path,
         return 1
 
     env_note = "" if "hydra" in sys.modules else ""
-    rc = run([python, str(exporter), "--workdir", work, "--checkpoint", ck,
-              "--umi-root", umi_root, "--out", out, "--archive", archive],
-             cwd=work, title=f"젯슨 변환 ({name}){env_note}")
+    argv = [python, str(exporter), "--workdir", str(work), "--checkpoint", str(ck),
+            "--umi-root", str(umi_root), "--out", str(out), "--archive", str(archive)]
+    rel = [v for v in argv[2:] if v.startswith("-") is False and not v.startswith("/")]
+    if rel:
+        print(f"!! 상대경로가 섞였다 {rel} — 변환기는 cwd 기준으로 찾는다. 중단")
+        return 1
+    rc = run(argv, cwd=work, title=f"젯슨 변환 ({name}){env_note}")
     if rc != 0:
         print("\n!! 변환기가 실패했다. 위 로그의 마지막 예외를 본다")
         print("   `KeyError: 'epoch'` 면 경량 ckpt 를 넣은 것이다 — 원본 best.ckpt 를 써라")
@@ -315,6 +326,14 @@ def selftest() -> int:
         chk("5 action_scale 길이 7 -> 불합격 (판별행)",
             any(r["name"].startswith("action_scale") and r["ok"] is False
                 for r in verify(short, None)["rows"]))
+
+        # 오늘 실증: 상대경로를 넘겨 변환기가 cwd 기준으로 찾다 죽었다
+        _argv = ["py", "exp.py", "--workdir", "/a/b", "--checkpoint", "out/x/best.ckpt"]
+        _rel = [v for v in _argv[2:] if not v.startswith("-") and not v.startswith("/")]
+        chk("6b 상대경로가 섞이면 잡힌다 (판별행)", _rel == ["out/x/best.ckpt"], str(_rel))
+        _argv2 = ["py", "exp.py", "--workdir", "/a/b", "--checkpoint", "/a/c/best.ckpt"]
+        chk("6c 전부 절대경로면 안 잡힌다 (정답 아는 행)",
+            [v for v in _argv2[2:] if not v.startswith("-") and not v.startswith("/")] == [])
 
         chk("6 robot_execution_enabled 는 판정하지 않고 찍기만 한다",
             any(r["name"].startswith("robot_execution_enabled") and r["ok"] is True
