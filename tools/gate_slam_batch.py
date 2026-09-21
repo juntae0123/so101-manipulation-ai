@@ -31,6 +31,8 @@ from pathlib import Path
 # ── 게이트 (배치 돌리기 전에 박는다) ────────────────────────────────────────
 # 참조: 현석 dataset_config (maximum_lost_frames 10 · marker_missing_run 15 · gap<=0.09m)
 #       SO-101 도달 반경 0.3m · 현석 s22 편당 이동거리 0.371m
+SOFT_NAMES = {"편당 이동거리 m", "카메라 궤적 범위 m"}   # 권고. 폐기 사유가 아니다
+
 GATES = {
     "tracked_ratio_min":    {"v": 0.98, "why": "초기화 후 추적률. 현석 배치는 1.0 이었다"},
     "loss_episodes_max":    {"v": 10,   "why": "현석 config maximum_lost_frames_after_initialization"},
@@ -111,7 +113,7 @@ def judge(r: dict, gates: dict | None = None) -> dict:
     #    돌아갔다.** 긴 궤적은 재현 난이도이지 폐기 사유가 아니다.
     #    프로젝트 기조 — "결과 모방이지 궤적 모방이 아니다."
     #    필수(SLAM 품질) 와 권고(시연 스타일) 를 가른다. 판정은 필수만 본다.
-    SOFT = {"편당 이동거리 m", "카메라 궤적 범위 m"}
+    SOFT = SOFT_NAMES
 
     def row(n, ok, got, want):
         rows.append({"name": n, "ok": ok, "got": got, "want": want,
@@ -289,14 +291,17 @@ def main() -> None:
     print(f"권고 경고가 붙은 편 {warned} / {n}  (재현 난이도 경고이지 폐기 사유가 아니다)")
     print("\n항목별 불합격 수 (분모 전부 %d편)" % n)
     for k, v in per.most_common():
-        tier = "권고" if k in {"편당 이동거리 m", "카메라 궤적 범위 m"} else "필수"
+        tier = "권고" if k in SOFT_NAMES else "필수"
         print(f"  [{tier}] {k:<22} {v:>4} 편  ({v / n:.0%})")
     if unk:
         print("항목별 미판정 수")
         for k, v in unk.most_common():
             print(f"  {k:<22} {v:>4} 편")
-    if per and max(per.values()) == n:
-        print("\n** 한 항목이 전 편을 떨어뜨린다. 데이터가 아니라 그 기준을 먼저 의심해라 **")
+    # ⚠️ 이 경고는 **필수** 항목용이다. 권고(시연 스타일)는 전 편에 붙는 게 정상이라
+    #    거기까지 세면 "기준을 의심해라"가 오해를 부른다 (2026-09-21 현장에서 확인).
+    hard_hits = {k: v for k, v in per.items() if k not in SOFT_NAMES}
+    if hard_hits and max(hard_hits.values()) == n:
+        print("\n** 필수 한 항목이 전 편을 떨어뜨린다. 데이터가 아니라 그 기준을 먼저 의심해라 **")
     for x in b["rows"]:
         mark = {True: "통과", False: "불합격", None: "미판정"}[x["ok"]]
         print(f"[{mark:^4}] {x['name']:<24} {x['got']}   기준 {x['want']}")
