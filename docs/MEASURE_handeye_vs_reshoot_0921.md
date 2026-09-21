@@ -47,6 +47,29 @@ hand-eye 물리검증   41.60 → 39.71  =  1.9 mm   (데이터 고정)
 
 **개선의 8할이 재촬영에서 왔다.** hand-eye 물리검증은 1.9mm 다.
 
+## 판별행 — 이 귀속을 무너뜨릴 수 있는 검사 🟢
+
+세 배치가 **실제로 다른 camera_tcp 파일을 썼는지**를 report 의
+`config_sha256.camera_tcp` 로 대조했다. v4 도 검증판을 썼다면 1.9mm 를
+hand-eye 효과로 귀속할 수 없다.
+
+| 배치 | `config_sha256.camera_tcp` | status |
+|---|---|---|
+| v4 | `00955e026e45ea5d…` | `cad_estimate_axis_mapping_unvalidated` |
+| s22_pick_v3 | `4e16c0a2db7e3a4c…` | `physically_validated` |
+| 20260921 | `4e16c0a2db7e3a4c…` | `physically_validated` |
+
+**v4 만 다른 파일이고 나머지 둘은 같다.** 귀속이 선다.
+
+부수 확인 — 우리 핸드오프 사본
+(`handoff/final/02_umi_dataset_builder/configs/s22_camera_tcp.json`) 의 sha256 이
+`00955e026e45ea5d…` 로 **v4 가 쓴 그 파일과 같다.** 즉 우리 빌더는 지금 v4 시절
+미검증 판을 쓰고 있다.
+
+`physically_validated` 판(`4e16c0a2…`)은 **서버·로컬 어디에도 없다.**
+전 마운트 폴더 8곳과 서버 `~/hyeonseok` 전체를 이름으로 훑어 0건이다.
+현석 기계에서 받아야 한다.
+
 ## 2026-09-20 진술 정정
 
 어시스턴트가 "hand-eye 가 41.6 → 24.4mm 를 만들었다"고 말한 것은 **틀렸다.**
