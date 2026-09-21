@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "output_resolution": [
+    224,
+    224
+  ],
+  "minimum_episode_frames": 30,
+  "episode_start_trim_s": 0.0,
+  "maximum_lost_frames_after_initialization": 10,
+  "maximum_marker_missing_run_frames": 15,
+  "maximum_gripper_width_m": 0.09,
+  "maximum_pose_timestamp_error_ms": 2.0,
+  "inpaint_aruco_markers": true,
+  "require_success_outcome": true
+}

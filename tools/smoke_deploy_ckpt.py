@@ -102,19 +102,20 @@ def stage0(ckpt_path: Path, man: dict | None) -> tuple[int, int, dict]:
         "runtimeSpec.num_inference_steps": at(cfg, "policy.num_inference_steps"),
     }
     if man:
-        exp = {
-            "actionSpec.horizon": man["actionSpec"]["horizon"],
-            "actionSpec.n_action_steps": man["actionSpec"]["n_action_steps"],
-            "runtimeSpec.action_pose_repr": man["runtimeSpec"]["required_kwarg"]["action_pose_repr"],
-            "runtimeSpec.obs_down_sample_steps": man["runtimeSpec"]["obs_down_sample_steps"],
-            "runtimeSpec.num_inference_steps": man["runtimeSpec"]["num_inference_steps"],
-        }
+        # ⚠️ 2026-09-21 — 학습 매니페스트를 그대로 넣었더니 KeyError 로 **죽었다**.
+        #    죽는 검사기는 검사기가 아니다. 없는 키는 미판정으로 세고 계속 간다.
+        exp, missing = manifest_contract(man)
+        if missing:
+            check("manifest 가 배포 계약 스키마인가", False,
+                  f"없는 키 {missing} — 학습 매니페스트로 보인다. "
+                  "export_deploy_ckpt.py 를 먼저 돌려라. 대조 불가는 통과가 아니다")
         # ⚠️ str() 비교라 둘 다 None 이면 'None' == 'None' 으로 일치가 된다.
         #    "둘 다 없음"이 "둘 다 맞음"으로 보이지 않게 None 을 따로 센다.
-        both_none = [k for k in exp if got[k] is None and exp[k] is None]
-        bad = [k for k in exp if str(got[k]) != str(exp[k])]
-        check("계약값이 manifest 와 일치", not bad and not both_none,
-              f"{len(exp) - len(bad) - len(both_none)} / {len(exp)}"
+        both_none = [k for k in exp if got[k] is None and exp[k] is None] if exp else []
+        bad = [k for k in exp if str(got[k]) != str(exp[k])] if exp else []
+        check("계약값이 manifest 와 일치", bool(exp) and not bad and not both_none,
+              f"{len(exp) - len(bad) - len(both_none)} / {len(CONTRACT_KEYS)}"
+              + ("  대조할 키가 하나도 없다" if not exp else "")
               + (f"  불일치 {bad}" if bad else "")
               + (f"  양쪽 모두 None {both_none}" if both_none else ""))
         _ok, _why = anchor_verdict(man)
@@ -239,6 +240,33 @@ def stage1(ctx: dict) -> tuple[int, int]:
     return ok, total
 
 
+CONTRACT_KEYS = {
+    "actionSpec.horizon": ("actionSpec", "horizon"),
+    "actionSpec.n_action_steps": ("actionSpec", "n_action_steps"),
+    "runtimeSpec.action_pose_repr": ("runtimeSpec", "required_kwarg", "action_pose_repr"),
+    "runtimeSpec.obs_down_sample_steps": ("runtimeSpec", "obs_down_sample_steps"),
+    "runtimeSpec.num_inference_steps": ("runtimeSpec", "num_inference_steps"),
+}
+
+
+def manifest_contract(man: dict) -> tuple[dict, list[str]]:
+    """Read the deploy contract out of a manifest without raising on absent keys.
+    없는 키에 터지지 않고 계약값을 읽는다. 반환 (읽힌 값, 없는 키 이름들)."""
+    exp, missing = {}, []
+    for name, path in CONTRACT_KEYS.items():
+        cur = man
+        for part in path:
+            if not isinstance(cur, dict) or part not in cur:
+                cur = None
+                break
+            cur = cur[part]
+        if cur is None:
+            missing.append(name)
+        else:
+            exp[name] = cur
+    return exp, missing
+
+
 def anchor_verdict(man: dict | None) -> tuple[bool, str]:
     """Chunk-anchor gate: absence is NOT a pass.
     청크 앵커 규약 판정 (D-AI-80). 키가 없으면 '대조 불가'이지 통과가 아니다.
@@ -283,6 +311,20 @@ def selftest() -> int:
     check("앵커 값이 누적 -> 실패 (판별행)",
           anchor_verdict({"actionSpec": {"chunk_anchor": "accumulate"}})[0] is False)
     check("manifest 없음 -> 실패 (판별행)", anchor_verdict(None)[0] is False)
+
+    # [7-9] 학습 매니페스트(배포 계약 없음)를 넣어도 **죽지 않는지**. 2026-09-21 회귀
+    train_man = {"run_id": "x", "best_checkpoint": {"epoch": 7}}
+    _e, _m = manifest_contract(train_man)
+    check("학습 매니페스트 -> 죽지 않고 미판정", _e == {} and len(_m) == len(CONTRACT_KEYS),
+          f"읽힘 {len(_e)} / 없는 키 {len(_m)} / 전체 {len(CONTRACT_KEYS)}")
+    _e2, _m2 = manifest_contract(man)
+    check("배포 매니페스트 -> 전부 읽힘 (정답 아는 행)",
+          len(_e2) == len(CONTRACT_KEYS) and _m2 == [],
+          f"읽힘 {len(_e2)} / {len(CONTRACT_KEYS)}")
+    _e3, _m3 = manifest_contract({"actionSpec": {"horizon": 16}})
+    check("일부만 있는 매니페스트 -> 부분 보고 (판별행)",
+          len(_e3) == 1 and len(_m3) == len(CONTRACT_KEYS) - 1,
+          f"읽힘 {len(_e3)} / 없음 {len(_m3)}")
     try:
         import torch  # noqa: F401
         t = True
