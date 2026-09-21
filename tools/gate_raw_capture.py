@@ -68,14 +68,27 @@ def read_csv(p: Path) -> list[dict]:
         return list(csv.DictReader(f))
 
 
+COLUMN_DROPS: dict[str, str] = {}      # 열 이름 -> "남은 행/전체 행". 모수를 잃지 않는다
+
+
 def col(rows: list[dict], name: str) -> list[float]:
-    """One numeric column, non-numeric rows dropped. 숫자 열 하나."""
-    out = []
+    """One numeric column. 숫자 열 하나. **버린 행 수를 반드시 남긴다.**
+
+    ⚠️ 초판은 파싱 실패를 조용히 삼켰다. 열 이름이 틀리면 전부 버려지고 빈 목록이
+    나오는데, 그게 "값이 없다"와 같은 출력이라 열 오타가 미판정으로 둔갑한다.
+    """
+    out, dropped = [], 0
     for r in rows:
         try:
             out.append(float(r[name]))
         except (KeyError, TypeError, ValueError):
-            pass
+            dropped += 1
+    if rows:
+        COLUMN_DROPS[name] = f"{len(out)}/{len(rows)}"
+        if not out:
+            print(f"  ⚠️ 열 '{name}' 에서 {len(rows)}행 전부 파싱 실패 — "
+                  f"열 이름이 틀렸거나 형식이 바뀌었다. 빈 값으로 넘어가지 마라",
+                  file=sys.stderr)
     return out
 
 
