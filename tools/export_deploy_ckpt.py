@@ -239,6 +239,122 @@ def build_manifest(cfg, n_params: int, src: Path, out: Path,
     }
 
 
+# ── 4파일 배치 (현석 요구 규약, 2026-09-21) ──────────────────────────────────
+#   models/<run_id>/ encoder.pt · denoiser.pt · metadata.json · dataset.report.json
+#
+# ⚠️ 쪼개는 순간 `cfg` 가 갈 곳이 없어진다. cfg 가 없으면 받는 쪽이 모델 구조를
+#    **코드로 하드코딩**해야 하고, 학습 설정이 바뀌면 말없이 어긋난다.
+#    파일 목록은 요구대로 4개를 지키되, **cfg 전체를 metadata.json 안에 넣는다.**
+ENCODER_PREFIXES = ("obs_encoder",)
+
+
+def split_state(ema: dict) -> tuple[dict, dict, dict]:
+    """Split ema_model into encoder / denoiser. 인코더와 디노이저로 가른다.
+
+    접두어로 가르고 **합집합이 원본과 정확히 같은지** 검산한다. 하나라도 빠지거나
+    겹치면 조용히 틀린 파일이 나간다.
+    """
+    import collections
+    census = dict(collections.Counter(k.split(".")[0] for k in ema))
+    enc = {k: v for k in ema for v in [ema[k]] if k.startswith(ENCODER_PREFIXES)}
+    den = {k: v for k, v in ema.items() if not k.startswith(ENCODER_PREFIXES)}
+    lost = set(ema) - (set(enc) | set(den))
+    dup = set(enc) & set(den)
+    if lost or dup:
+        raise RuntimeError(f"키가 샜다 — 누락 {len(lost)} · 중복 {len(dup)}")
+    return enc, den, census
+
+
+def export_split(src: Path, out_dir: Path, note: str, dataset_report: Path | None) -> int:
+    """Write the four-file layout. 네 파일 배치로 쓴다. 되읽어 검산한다."""
+    import json as _json
+    import shutil
+
+    import torch
+    payload = torch.load(src, map_location="cpu", weights_only=False)
+    info = inspect(payload)
+    print(_json.dumps(info, ensure_ascii=False, indent=2))
+    if info["missing_top"] or info["missing_state"]:
+        print(f"!! 필수 키 누락 {info['missing_top'] + info['missing_state']} — 중단")
+        return 1
+
+    ema = payload["state_dicts"]["ema_model"]
+    n_params = count_params(ema)
+    enc, den, census = split_state(ema)
+    print(f"\n최상위 접두어 {census}")
+    print(f"encoder  텐서 {len(enc):>4} · 파라미터 {count_params(enc):,}")
+    print(f"denoiser 텐서 {len(den):>4} · 파라미터 {count_params(den):,}")
+    if not enc or not den:
+        print(f"!! 한쪽이 비었다 (encoder {len(enc)} · denoiser {len(den)}) — "
+              f"접두어 규약을 확인해라. 접두어 목록 {sorted(census)}")
+        return 1
+    if count_params(enc) + count_params(den) != n_params:
+        print("!! 파라미터 합이 원본과 다르다 — 내보내지 않는다")
+        return 1
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    p_enc, p_den = out_dir / "encoder.pt", out_dir / "denoiser.pt"
+    p_meta, p_rep = out_dir / "metadata.json", out_dir / "dataset.report.json"
+    torch.save(enc, p_enc)
+    torch.save(den, p_den)
+
+    try:
+        import dill
+        epoch = dill.loads(payload["pickles"]["epoch"])
+    except Exception:                                  # noqa: BLE001
+        epoch = "미기록"
+
+    man = build_manifest(payload["cfg"], n_params, src, p_den, note, epoch)
+    man["layout"] = "split_v1"
+    man["files"] = {
+        "encoder.pt": {"tensors": len(enc), "params": count_params(enc),
+                       "sha256": sha256(p_enc), "bytes": p_enc.stat().st_size,
+                       "key_prefixes": list(ENCODER_PREFIXES)},
+        "denoiser.pt": {"tensors": len(den), "params": count_params(den),
+                        "sha256": sha256(p_den), "bytes": p_den.stat().st_size,
+                        "key_prefixes": "그 외 전부"},
+    }
+    man["state_dict_census"] = census
+    # ⚠️ cfg 를 여기 넣는다. 파일을 4개로 유지하면서 재구성 가능성을 지키는 유일한 자리다.
+    man["train_cfg"] = plain(payload["cfg"])
+    man["reassemble"] = (
+        "encoder.pt 와 denoiser.pt 의 state_dict 를 합치면 ema_model 이 된다. "
+        "모델은 train_cfg.policy 로 instantiate 한다. "
+        "합친 파라미터 수가 nParams 와 같아야 한다 — 다르면 쓰지 마라")
+    p_meta.write_text(_json.dumps(man, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # dataset.report.json — 없으면 **실패다.** 빈 파일을 만들지 않는다
+    rep = dataset_report
+    if rep is None:
+        cand = at(payload.get("cfg"), "task.dataset.dataset_path")
+        rep = Path(str(cand) + ".report.json") if cand else None
+    if rep is None or not Path(rep).exists():
+        print(f"\n!! dataset.report.json 을 못 찾았다 ({rep}) — "
+              "--dataset-report 로 경로를 줘라. 빈 파일을 만들지 않는다")
+        return 1
+    shutil.copyfile(rep, p_rep)
+
+    # 되읽기 검산 — 저장했다고 담긴 게 아니다
+    back_e = torch.load(p_enc, map_location="cpu", weights_only=False)
+    back_d = torch.load(p_den, map_location="cpu", weights_only=False)
+    merged = {**back_e, **back_d}
+    same_keys = set(merged) == set(ema)
+    same_n = count_params(merged) == n_params
+    import torch as _t
+    diff = [k for k in ema if not _t.equal(merged[k], ema[k])] if same_keys else ["키 불일치"]
+    print(f"\n되읽기 검산   키 {'일치' if same_keys else '불일치'} "
+          f"({len(merged)}/{len(ema)}) · nParams {count_params(merged):,}/{n_params:,} "
+          f"· 값 불일치 {len(diff)}개")
+    if not (same_keys and same_n and not diff):
+        print("!! 되읽은 것이 원본과 다르다 — 내보내지 않는다")
+        return 1
+
+    for p in (p_enc, p_den, p_meta, p_rep):
+        print(f"  -> {p.name:<22} {p.stat().st_size:>12,} B")
+    print(f"\n-> {out_dir}")
+    return 0
+
+
 def export(src: Path, out: Path, note: str) -> int:
     """Strip to ema_model + write the contract manifest, then read back to verify.
     ema_model 만 남기고 계약 manifest 를 쓴 뒤, 되읽어 검산한다."""
@@ -332,6 +448,17 @@ def selftest() -> int:
         total += 1
         ok += bool(cond)
         print(f"[{total}] {name:<44} {'OK' if cond else '!! 실패'}  {detail}")
+
+    # [split] 키 분리 — 하나라도 새면 조용히 틀린 파일이 나간다
+    _ema = {"obs_encoder.a": 1, "obs_encoder.b": 2, "model.x": 3, "model.y": 4, "normalizer.z": 5}
+    _e, _d, _c = split_state(_ema)
+    check("split 합집합이 원본과 같다", set(_e) | set(_d) == set(_ema) and not (set(_e) & set(_d)),
+          f"encoder {len(_e)} + denoiser {len(_d)} = {len(_ema)}")
+    check("split 접두어 census", _c == {"obs_encoder": 2, "model": 2, "normalizer": 1}, str(_c))
+    check("encoder 가 아닌 것은 전부 denoiser 로 (판별행)",
+          set(_d) == {"model.x", "model.y", "normalizer.z"}, str(sorted(_d)))
+    _e2, _d2, _ = split_state({"model.x": 1})
+    check("encoder 가 비면 비었다고 나온다 (판별행)", len(_e2) == 0 and len(_d2) == 1)
 
     good = {"cfg": {}, "state_dicts": {"model": {}, "ema_model": {}, "optimizer": {}}}
     i = inspect(good)
@@ -459,9 +586,19 @@ def main() -> None:
     ap.add_argument("--checkpoint")
     ap.add_argument("--out")
     ap.add_argument("--note", default="")
+    ap.add_argument("--layout", choices=("single", "split"), default="single",
+                    help="single=.ckpt+.manifest.json · split=encoder/denoiser 4파일")
+    ap.add_argument("--out-dir", help="--layout split 의 출력 폴더 (models/<run_id>/)")
+    ap.add_argument("--dataset-report", help="dataset.report.json 경로 (split 에서 필요)")
     a = ap.parse_args()
     if a.selftest:
         sys.exit(selftest())
+    if a.layout == "split":
+        if not (a.checkpoint and a.out_dir):
+            ap.error("--layout split 에는 --checkpoint 와 --out-dir 이 필요하다")
+        sys.exit(export_split(Path(a.checkpoint).expanduser(),
+                              Path(a.out_dir).expanduser(), a.note,
+                              Path(a.dataset_report).expanduser() if a.dataset_report else None))
     if not (a.checkpoint and a.out):
         ap.error("--checkpoint 와 --out 이 필요하다 (또는 --selftest)")
     sys.exit(export(Path(a.checkpoint).expanduser(), Path(a.out).expanduser(), a.note))
