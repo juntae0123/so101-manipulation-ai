@@ -25,7 +25,13 @@ CONTRACT_VERSION = "so101-policy-v1"
 
 # ── 액션 계약. 출처: so101_pick_v1.manifest.json actionSpec ──────────────────
 ACTION_DIM = 10
-ACTION_HORIZON = 8
+# ⚠️ 2026-09-21 정정 (D-AI-81). 초판은 8 을 **상수로 박고 shape 를 등호 비교**했다.
+#    공식 UMI 기본값은 16 이고 현석 e120 ckpt 도 16 이다 🟢 — 등호 비교가 정상 ckpt 를
+#    거부했다 (smoke [2] 출력 모양 (16,10) 불합격). horizon 은 ckpt 마다 다를 수 있으므로
+#    **매니페스트 actionSpec.horizon 에서 받는다.** 아래는 '못 받았을 때'의 값이 아니라
+#    참고값이다. unroll 은 horizon 을 받으면 등호로, 못 받으면 실행 슬라이스를 덮는지만 본다.
+ACTION_HORIZON_REFERENCE = 16    # 공식 UMI 기본 · 현석 e120 확인
+ACTION_HORIZON = ACTION_HORIZON_REFERENCE
 EXEC_SLICE = (1, 5)              # execSlice. cfg 값이 아니라 실행측 선택이다
 ROT6D_ROWS = True                # "회전행렬의 첫 두 행. 열이 아니다"
 NOMINAL_RATE_HZ = 10.0           # 공칭. 실제 시각은 observation_timestamp 에서 읽는다.
@@ -127,7 +133,7 @@ def action_to_T(a10) -> tuple[np.ndarray, float]:
     return T, gap
 
 
-def unroll(T_start, chunks, exec_slice=EXEC_SLICE) -> tuple[list, list]:
+def unroll(T_start, chunks, exec_slice=EXEC_SLICE, horizon=None) -> tuple[list, list]:
     """상대 액션 청크들을 절대 TCP 궤적으로 편다.
 
     ⚠️ 2026-09-20 정정 (D-AI-80). 초판은 청크 **안에서** `T = T @ A` 로 누적했다.
@@ -138,13 +144,22 @@ def unroll(T_start, chunks, exec_slice=EXEC_SLICE) -> tuple[list, list]:
     액션 한 행은 전부 **청크 시작 pose 기준**이다. 청크 안에서 앵커는 바뀌지 않는다.
     청크 사이에서만 앵커가 마지막 실행점으로 넘어간다 (실물에서는 재관측 pose).
     근거: AI/tools/probe_chunk_anchor.py · out/anchor_0920.json
+
+    horizon: 매니페스트 `actionSpec.horizon` 을 주면 **등호로** 검사한다. None 이면
+    dim 과 "실행 슬라이스를 덮는가"만 본다. 8 을 상수로 박아 등호 비교하던 것이
+    2026-09-21 에 정상 ckpt(16)를 거부했다 (D-AI-81).
     """
     lo, hi = exec_slice
     T, poses, gaps = np.asarray(T_start, float).copy(), [], []
     for ch in chunks:
         ch = np.asarray(ch, float)
-        if ch.shape != (ACTION_HORIZON, ACTION_DIM):
-            raise ValueError(f"청크 shape {ch.shape}, 기대 ({ACTION_HORIZON},{ACTION_DIM})")
+        if ch.ndim != 2 or ch.shape[1] != ACTION_DIM:
+            raise ValueError(f"청크 shape {ch.shape}, 기대 (*,{ACTION_DIM})")
+        if horizon is not None and ch.shape[0] != horizon:
+            raise ValueError(f"청크 horizon {ch.shape[0]}, 매니페스트 {horizon}")
+        if ch.shape[0] < hi:
+            raise ValueError(f"청크 horizon {ch.shape[0]} < 실행 슬라이스 끝 {hi} — "
+                             "실행할 행이 모자란다")
         T0 = T.copy()                    # 이 청크의 앵커. 청크 안에서 고정이다
         for row in ch[lo:hi]:
             A, gap = action_to_T(row)
@@ -388,6 +403,25 @@ def _selftest() -> int:
     ch[:, 0] = 0.002; ch[:, 9] = 0.05
     p, g = unroll(np.eye(4), [ch, ch])
     chk("5 unroll 길이", len(p) == 2 * (EXEC_SLICE[1] - EXEC_SLICE[0]), f"{len(p)}/8")
+    # [5a] horizon 계약 (D-AI-81). 등호로 박으면 정상 ckpt 를 거부한다
+    _h8 = np.zeros((8, ACTION_DIM)); _h8[:, 3:9] = matrix_to_rot6d(np.eye(3))
+    _h16 = np.zeros((16, ACTION_DIM)); _h16[:, 3:9] = matrix_to_rot6d(np.eye(3))
+    _h3 = np.zeros((3, ACTION_DIM)); _h3[:, 3:9] = matrix_to_rot6d(np.eye(3))
+    _ok8 = _ok16 = True
+    try: unroll(np.eye(4), [_h8])
+    except ValueError: _ok8 = False
+    try: unroll(np.eye(4), [_h16])
+    except ValueError: _ok16 = False
+    _rej3 = False
+    try: unroll(np.eye(4), [_h3])
+    except ValueError: _rej3 = True
+    _rej_mismatch = False
+    try: unroll(np.eye(4), [_h8], horizon=16)
+    except ValueError: _rej_mismatch = True
+    chk("5a horizon 8·16 둘 다 수용, hi 미만은 거부 (판별행)",
+        _ok8 and _ok16 and _rej3, f"8 {_ok8} · 16 {_ok16} · 3 거부 {_rej3}")
+    chk("5a2 매니페스트 horizon 과 불일치는 거부 (정답 아는 행)", _rej_mismatch,
+        f"8행 청크에 horizon=16 -> 거부 {_rej_mismatch}")
     # [5b-5d] 앵커 규약 정답 아는 행 (D-AI-80). 길이만 보면 누적/앵커가 같은 출력이다
     _lo, _hi = EXEC_SLICE
     _n = _hi - _lo

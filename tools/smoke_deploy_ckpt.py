@@ -228,7 +228,16 @@ def stage1(ctx: dict) -> tuple[int, int]:
     with torch.inference_mode():
         out = policy.predict_action(batch)
     act = out["action"][0].detach().cpu().numpy()
-    check("출력 모양 (8, 10)", act.shape == (8, 10), str(act.shape))
+    # ⚠️ 2026-09-21 — (8,10) 을 리터럴로 박아 현석 e120 ckpt(16,10)를 헛불합격시켰다.
+    #    horizon 은 매니페스트에서 받는다. 못 받으면 **미판정**이지 통과가 아니다 (D-AI-81).
+    _h = ((ctx or {}).get("manifest") or {}).get("actionSpec", {}).get("horizon")
+    _d = ((ctx or {}).get("manifest") or {}).get("actionSpec", {}).get("dim") or 10
+    if _h is None:
+        check("출력 모양 (horizon, dim)", None,
+              f"{act.shape} / 매니페스트에 actionSpec.horizon 이 없다 — 대조 불가는 통과가 아니다")
+    else:
+        check(f"출력 모양 ({_h}, {_d})", act.shape == (_h, _d),
+              f"{act.shape} / 기대 ({_h}, {_d})")
 
     pos = np.abs(act[:, :3]).max()
     gap = act[:, 9]
@@ -355,6 +364,7 @@ def main() -> None:
     print("=== 단계 0 · 파일 온전성과 계약 대조 (torch 만 필요) ===")
     o0, t0, ctx = stage0(Path(a.checkpoint).expanduser(), man)
     ctx["umi_root"] = a.umi_root
+    ctx["manifest"] = man        # 단계 1 이 horizon 을 여기서 받는다 (D-AI-81)
     print(f"  단계 0: {o0} / {t0}")
 
     o1 = t1 = 0
