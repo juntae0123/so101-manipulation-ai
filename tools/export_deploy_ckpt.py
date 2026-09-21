@@ -375,7 +375,18 @@ def export(src: Path, out: Path, note: str) -> int:
     except Exception:                                  # noqa: BLE001 — 없으면 없는 대로 적는다
         epoch = "미기록"
 
+    # ⚠️ 2026-09-21 — 초판은 `pickles` 를 통째로 버렸다. 하류의 젯슨 변환기가
+    #    `payload["pickles"]["epoch"]` 를 읽어서, 우리 경량본을 넣으면 KeyError 로
+    #    metadata.json 을 쓰기 직전에 죽는다 (실제로 오늘 현석 쪽에서 그렇게 멈췄다).
+    #    epoch 한 항목만 살린다 — 크기는 무시할 수준이고 하류가 산다.
     slim = {"cfg": payload["cfg"], "state_dicts": {"ema_model": ema}}
+    _pk = payload.get("pickles")
+    if isinstance(_pk, dict) and "epoch" in _pk:
+        slim["pickles"] = {"epoch": _pk["epoch"]}
+        print("pickles.epoch  보존 (하류 젯슨 변환기가 읽는다)")
+    else:
+        print("!! pickles.epoch 가 원본에 없다 — 하류 변환기가 epoch 를 못 읽는다. "
+              "manifest 를 ckpt 옆에 같이 둬라")
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(slim, out)
 
@@ -398,6 +409,10 @@ def export(src: Path, out: Path, note: str) -> int:
     back = torch.load(out, map_location="cpu", weights_only=False)
     ok = (set(back["state_dicts"]) == {"ema_model"}
           and count_params(back["state_dicts"]["ema_model"]) == n_params)
+    # 하류 계약: 젯슨 변환기가 pickles.epoch 를 읽는다. 되읽어서 실제로 있는지 본다
+    _has = isinstance(back.get("pickles"), dict) and "epoch" in back["pickles"]
+    print(f"pickles.epoch 되읽기  {'있음' if _has else '**없음**'}"
+          + ("" if _has else "  <- 젯슨 변환기가 KeyError 로 죽는다"))
     print(f"되읽기 검산   {'OK' if ok else '!! 불일치'}  "
           f"(키 {set(back['state_dicts'])}, nParams {count_params(back['state_dicts']['ema_model']):,})")
 
@@ -452,6 +467,23 @@ def selftest() -> int:
     # [split] 키 분리 — 하나라도 새면 조용히 틀린 파일이 나간다
     _ema = {"obs_encoder.a": 1, "obs_encoder.b": 2, "model.x": 3, "model.y": 4, "normalizer.z": 5}
     _e, _d, _c = split_state(_ema)
+    # [pickles] 하류 계약 — epoch 만 살리고 나머지는 버린다
+    def _slim(payload):
+        out = {"cfg": payload.get("cfg"), "state_dicts": {"ema_model": {}}}
+        pk = payload.get("pickles")
+        if isinstance(pk, dict) and "epoch" in pk:
+            out["pickles"] = {"epoch": pk["epoch"]}
+        return out
+    _full = {"cfg": {}, "state_dicts": {"ema_model": {}, "model": {}},
+             "pickles": {"epoch": b"x", "cfg": b"y", "other": b"z"}}
+    _s = _slim(_full)
+    check("pickles.epoch 만 살아남는다", set(_s.get("pickles", {})) == {"epoch"},
+          f"{sorted(_s.get('pickles', {}))} / 원본 {sorted(_full['pickles'])}")
+    check("pickles 없는 원본 -> 키 자체가 안 생긴다 (판별행)",
+          "pickles" not in _slim({"cfg": {}, "state_dicts": {"ema_model": {}}}))
+    check("epoch 없는 pickles -> 키 자체가 안 생긴다 (판별행)",
+          "pickles" not in _slim({"cfg": {}, "state_dicts": {}, "pickles": {"cfg": b"y"}}))
+
     check("split 합집합이 원본과 같다", set(_e) | set(_d) == set(_ema) and not (set(_e) & set(_d)),
           f"encoder {len(_e)} + denoiser {len(_d)} = {len(_ema)}")
     check("split 접두어 census", _c == {"obs_encoder": 2, "model": 2, "normalizer": 1}, str(_c))
