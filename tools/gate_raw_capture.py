@@ -41,7 +41,11 @@ NS = 1e9
 #   편 길이 73~137 프레임 @30Hz = 2.4~4.6초 · 표본율 30.0021Hz
 GATES = {
     "frames_min":        {"v": 60,   "why": "30Hz 에서 2.0초. 접근이 안 담긴다"},
-    "frames_max":        {"v": 150,  "why": "30Hz 에서 5.0초. 현석 73~137, v4 165~300 은 길다"},
+    # ⚠️ 권고다. 폐기 사유가 아니다. 🟢 2026-09-21 — 필수로 뒀더니 92/92 전 편 불합격이
+    #    났는데, 바로 그 92편으로 현석 v4 학습이 돌았다. 이 프로젝트의 기조가
+    #    "결과 모방이지 궤적 모방이 아니다" 이므로 **시연 길이는 난이도 경고**로 둔다.
+    #    (같은 오류를 gate_slam_batch.py 에서 하루 전에 이미 고쳤다. 옮겨오지 못했다)
+    "frames_max":        {"v": 150,  "why": "권고. 30Hz 에서 5.0초. 현석 s22_pick_v3 73~137, v4 165~300"},
     "fps_lo":            {"v": 29.0, "why": "현석 30.0021Hz"},
     "fps_hi":            {"v": 31.0, "why": "동일"},
     "gap_ratio_max":     {"v": 2.5,  "why": "최대 프레임 간격 / 중앙. 2.5배 넘으면 드롭이다"},
@@ -153,28 +157,37 @@ def judge(r: dict, gates: dict | None = None) -> dict:
     g = {k: v["v"] for k, v in (gates or GATES).items()}
     rows = []
 
-    def row(name, ok, got, want):
-        rows.append({"name": name, "ok": ok, "got": got, "want": want})
+    def row(name, ok, got, want, soft=False):
+        rows.append({"name": name, "ok": ok, "got": got, "want": want, "soft": soft})
 
-    def band(name, val, lo, hi, fmt="{:.3f}"):
+    def band(name, val, lo, hi, fmt="{:.3f}", soft=False):
         if val is None:
-            row(name, None, "없음 — 대조 불가", f"{lo}~{hi}")
+            row(name, None, "없음 — 대조 불가", f"{lo}~{hi}", soft)
         else:
-            row(name, lo <= val <= hi, fmt.format(val), f"{lo}~{hi}")
+            row(name, lo <= val <= hi, fmt.format(val), f"{lo}~{hi}", soft)
 
-    def under(name, val, lim, fmt="{:.3f}"):
+    def under(name, val, lim, fmt="{:.3f}", soft=False):
         if val is None:
-            row(name, None, "없음 — 대조 불가", f"<= {lim}")
+            row(name, None, "없음 — 대조 불가", f"<= {lim}", soft)
         else:
-            row(name, val <= lim, fmt.format(val), f"<= {lim}")
+            row(name, val <= lim, fmt.format(val), f"<= {lim}", soft)
+
+    def over(name, val, lim, fmt="{:.3f}", soft=False):
+        if val is None:
+            row(name, None, "없음 — 대조 불가", f">= {lim}", soft)
+        else:
+            row(name, val >= lim, fmt.format(val), f">= {lim}", soft)
 
     row("촬영 성공 표기", r.get("outcome") == REQUIRED_OUTCOME, r.get("outcome"), REQUIRED_OUTCOME)
     row("녹화 상태", r.get("status") == REQUIRED_STATUS, r.get("status"), REQUIRED_STATUS)
     row("방향 규약", r.get("orientation_contract") == REQUIRED_ORIENT,
         r.get("orientation_contract"), REQUIRED_ORIENT)
     row("회전 픽셀에 반영", r.get("rotation_baked") is True, r.get("rotation_baked"), "True")
-    band("프레임 수", float(r["frames"]) if r.get("frames") else None,
-         g["frames_min"], g["frames_max"], "{:.0f}")
+    _fr = float(r["frames"]) if r.get("frames") else None
+    # 하한은 필수다 — 60프레임(2초) 밑이면 접근·파지가 담길 수 없다
+    over("프레임 수 하한", _fr, g["frames_min"], "{:.0f}")
+    # 상한은 **권고**다. 길다는 건 난이도 경고지 폐기 사유가 아니다
+    under("프레임 수 상한(권고)", _fr, g["frames_max"], "{:.0f}", soft=True)
     band("표본율 Hz", r.get("fps_median"), g["fps_lo"], g["fps_hi"])
     under("프레임 간격 최대/중앙", r.get("gap_ratio_max"), g["gap_ratio_max"])
     under("노출 변동계수", r.get("exposure_cv"), g["exposure_cv_max"])
@@ -190,10 +203,14 @@ def judge(r: dict, gates: dict | None = None) -> dict:
     row("영상 파일", r.get("video_bytes") is not None,
         f"{r.get('video_bytes')} B" if r.get("video_bytes") else "없음", "있을 것")
 
-    p = sum(1 for x in rows if x["ok"] is True)
-    f = sum(1 for x in rows if x["ok"] is False)
-    u = sum(1 for x in rows if x["ok"] is None)
-    return {"rows": rows, "passed": p, "failed": f, "unknown": u, "total": len(rows),
+    # 판정은 **필수 항목만** 본다. 권고는 따로 센다 — 섞으면 길다는 이유로 전 편이 날아간다
+    hard = [x for x in rows if not x["soft"]]
+    soft = [x for x in rows if x["soft"]]
+    p = sum(1 for x in hard if x["ok"] is True)
+    f = sum(1 for x in hard if x["ok"] is False)
+    u = sum(1 for x in hard if x["ok"] is None)
+    return {"rows": rows, "passed": p, "failed": f, "unknown": u, "total": len(hard),
+            "soft_total": len(soft), "soft_unmet": sum(1 for x in soft if x["ok"] is not True),
             "verdict": "PASS" if f == 0 and u == 0 else ("FAIL" if f else "INCOMPLETE")}
 
 
@@ -259,6 +276,15 @@ def selftest() -> int:
 
         short = judge(measure_episode(_write_synth(root, "short", frames=40)))
         chk("3 40프레임 -> FAIL (판별행)", short["verdict"] == "FAIL", short["verdict"])
+        _write_synth(root, "rec_long", frames=250)
+        lng = judge(measure_episode(root / "rec_long"))
+        chk("3b 250프레임 -> 권고만 미충족, 판정 PASS (정답 아는 행)",
+            lng["verdict"] == "PASS" and lng["soft_unmet"] == 1,
+            f"{lng['verdict']} · 권고 미충족 {lng['soft_unmet']}/{lng['soft_total']}")
+        _write_synth(root, "rec_50", frames=50)
+        shrt2 = judge(measure_episode(root / "rec_50"))
+        chk("3c 50프레임 -> 하한 필수 불합격 (판별행)",
+            shrt2["verdict"] == "FAIL", shrt2["verdict"])
 
         drop = measure_episode(_write_synth(root, "drop", drop_at=50))
         chk("4 프레임 드롭 잡힌다 (판별행)", judge(drop)["verdict"] == "FAIL",
@@ -321,14 +347,30 @@ def main() -> None:
         docs.append(r)
         tally[j["verdict"]] = tally.get(j["verdict"], 0) + 1
         mark = {"PASS": "통과", "FAIL": "불합격", "INCOMPLETE": "미판정"}[j["verdict"]]
-        print(f"[{mark:^4}] {d.name:<34} {j['passed']}/{j['total']}"
-              + ("   " + " · ".join(f"{x['name']} {x['got']}"
-                                    for x in j["rows"] if x["ok"] is not True) if j["verdict"] != "PASS" else ""))
+        miss = [x for x in j["rows"] if x["ok"] is not True and not x["soft"]]
+        smiss = [x for x in j["rows"] if x["ok"] is not True and x["soft"]]
+        print(f"[{mark:^4}] {d.name:<34} 필수 {j['passed']}/{j['total']}"
+              + (f" · 권고 미충족 {j['soft_unmet']}/{j['soft_total']}" if j["soft_unmet"] else "")
+              + ("   " + " · ".join(f"{x['name']} {x['got']}" for x in miss) if miss else "")
+              + ("   (권고) " + " · ".join(f"{x['name']} {x['got']}" for x in smiss) if smiss else ""))
 
     n = len(eps)
     print(f"\n통과 {tally['PASS']} · 불합격 {tally['FAIL']} · 미판정 {tally['INCOMPLETE']} / 전체 {n}")
+    soft_hits = sum(1 for d0 in docs if d0["gates"]["soft_unmet"])
+    if soft_hits:
+        print(f"권고 미충족 {soft_hits} / {n} 편 — 폐기 사유가 아니다. 다음 촬영에서 줄여라")
     if tally["PASS"] < n:
         print("** 미판정은 통과가 아니다. 불합격 편은 다시 찍는다 — 게이트를 낮추지 않는다 **")
+    # 부분합이 전체와 다르면 죽인다: 필수 한 항목이 전 편을 떨어뜨리면 게이트 쪽을 의심한다
+    per = {}
+    for d0 in docs:
+        for x in d0["gates"]["rows"]:
+            if x["ok"] is not True and not x["soft"]:
+                per[x["name"]] = per.get(x["name"], 0) + 1
+    if per and max(per.values()) == n:
+        worst = [k for k, v in per.items() if v == n]
+        print(f"\n** 필수 {worst} 가 전 {n} 편을 떨어뜨린다 — 데이터가 아니라 "
+              f"게이트가 틀렸을 수 있다. 참조 배치에 먼저 걸어봐라 **")
 
     if a.out:
         Path(a.out).parent.mkdir(parents=True, exist_ok=True)
