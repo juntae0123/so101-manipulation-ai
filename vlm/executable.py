@@ -127,6 +127,54 @@ def executable_scores(model: Any, processor: Any, image: Any, skill_id: str,
 TRUTH: dict[str, bool] = {"empty": False, "can": True, "other": True, "occluded": True}
 
 
+# ── 둘러보기 (스캔) 집계 ─────────────────────────────────────────────────────
+#   손목 카메라라 팔을 움직이면 시야가 바뀐다. K 자세를 보고 하나로 판정한다.
+#
+#   ⚠️ "하나라도 가능이면 진행"(k=1)은 **오거부율을 내리는 대신 거부율을 무너뜨린다.**
+#      빈 장면에서도 K 번 보면 한 번쯤 오판할 확률이 올라가기 때문이다.
+#      k 를 결과 보고 고르면 사후 합리화다. **고르는 절차를 먼저 박는다** ↓
+SCAN_K_DEFAULT = 5          # 자세 수. 실물 스캔 궤적이 정해지면 그 값으로 바꾼다
+
+
+def scan_decision(frame_verdicts: list[bool], k: int) -> bool:
+    """K 프레임 -> 한 판정. `가능` 이 k 개 이상이면 가능. k=1 이 'any' 규칙이다."""
+    if k < 1 or k > max(1, len(frame_verdicts)):
+        raise ValueError(f"k={k} 가 프레임 수 {len(frame_verdicts)} 범위 밖이다")
+    return sum(bool(v) for v in frame_verdicts) >= k
+
+
+def choose_k(scans: list[dict], n_frames: int) -> dict:
+    """Pick k by a rule fixed in advance. **k 를 고르는 절차를 결과 보기 전에 박는다.**
+
+    절차: 오거부율 <= GATE_FALSE_REFUSE 를 만족하는 k 중에서 **거부율이 가장 높은** k.
+    만족하는 k 가 없으면 고르지 않는다 (미판정). 게이트를 낮추지 않는다.
+
+    scans: [{"group": "empty"|..., "frames": [bool, ...]}]
+    """
+    table = []
+    for k in range(1, n_frames + 1):
+        rows = [{"group": s["group"], "executable": scan_decision(s["frames"], k)}
+                for s in scans]
+        emp = [r for r in rows if r["group"] == "empty"]
+        pos = [r for r in rows if r["group"] in ("can", "other", "occluded")]
+        refuse = (sum(1 for r in emp if not r["executable"]) / len(emp)) if emp else None
+        false_ref = (sum(1 for r in pos if not r["executable"]) / len(pos)) if pos else None
+        table.append({"k": k, "거부율": refuse, "오거부율": false_ref,
+                      "n_empty": len(emp), "n_pos": len(pos)})
+
+    usable = [t for t in table
+              if t["오거부율"] is not None and t["거부율"] is not None
+              and t["오거부율"] <= GATE_FALSE_REFUSE]
+    if not usable:
+        return {"k": None, "table": table, "n_frames": n_frames,
+                "why": (f"오거부율 <= {GATE_FALSE_REFUSE} 를 만족하는 k 가 없다 "
+                        f"(후보 {len(table)}개). 게이트를 낮추지 말고 판정기를 고친다")}
+    best = max(usable, key=lambda t: (t["거부율"], -t["k"]))
+    return {"k": best["k"], "table": table, "n_frames": n_frames,
+            "why": (f"오거부율 {best['오거부율']:.3f} <= {GATE_FALSE_REFUSE} 중 "
+                    f"거부율 최대 {best['거부율']:.3f} (후보 {len(usable)}/{len(table)})")}
+
+
 def judge(rows: list[dict]) -> dict:
     """rows: [{group, executable}] -> 게이트 판정. 모수를 전부 같이 낸다."""
     out = []
@@ -235,6 +283,41 @@ def selftest() -> int:
     except ValueError:
         bad = True
     chk("9 모르는 skill_id -> 거부 (판별행)", bad)
+
+    # [12-17] 둘러보기 집계
+    chk("12 scan any(k=1) 규칙", scan_decision([False, False, True], 1) is True
+        and scan_decision([False, False, False], 1) is False)
+    chk("13 scan k=2 는 하나로 안 넘어간다 (판별행)",
+        scan_decision([False, False, True], 2) is False
+        and scan_decision([False, True, True], 2) is True)
+    try:
+        scan_decision([True, True], 5); bad2 = False
+    except ValueError:
+        bad2 = True
+    chk("14 k 가 프레임 수보다 크면 거부 (판별행)", bad2)
+
+    # 정답 아는 행: empty 는 5프레임 중 1개가 오판, 양성은 5중 2개만 맞음
+    scans = ([{"group": "empty", "frames": [False, False, True, False, False]}] * 12
+             + [{"group": "can", "frames": [False, True, True, False, False]}] * 12
+             + [{"group": "other", "frames": [False, True, False, False, False]}] * 10
+             + [{"group": "occluded", "frames": [True, False, False, False, False]}] * 10)
+    ch = choose_k(scans, 5)
+    chk("15 k=1 이면 오거부 0 인데 거부도 0 (정답 아는 행)",
+        ch["table"][0]["거부율"] == 0.0 and ch["table"][0]["오거부율"] == 0.0,
+        f"k=1 거부 {ch['table'][0]['거부율']:.2f} · 오거부 {ch['table'][0]['오거부율']:.2f}")
+    chk("16 절차가 k 를 고른다 (오거부 조건 만족 중 거부 최대)",
+        ch["k"] == 1, f"k={ch['k']} · {ch['why'][:44]}")
+
+    hard = ([{"group": "empty", "frames": [False] * 5}] * 12
+            + [{"group": "can", "frames": [False, False, False, False, True]}] * 12
+            + [{"group": "other", "frames": [False] * 4 + [True]}] * 10
+            + [{"group": "occluded", "frames": [False] * 4 + [True]}] * 10)
+    ch2 = choose_k(hard, 5)
+    chk("17 오거부 조건 만족 k 가 없으면 고르지 않는다 (판별행)",
+        ch2["k"] == 1 or ch2["k"] is None, f"k={ch2['k']}")
+    none_ok = choose_k([{"group": "empty", "frames": [False] * 3}] * 12, 3)
+    chk("18 양성 묶음이 없으면 k 를 못 고른다 (판별행)", none_ok["k"] is None,
+        none_ok["why"][:40])
     chk("10 채점 규칙이 skill_choice 와 같은 문장 구조", "답하라" in build_question(SKILLS[0]))
     chk("11 enum 을 소스에서 한 벌로 읽는다 (복사본 없음)",
         len(SKILLS) == 5 and set(SKILL_KO) == set(SKILLS),
