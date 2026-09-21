@@ -46,8 +46,6 @@ META_KEYS = ("shape_meta", "scheduler", "inference_steps", "inference_image_tran
              "action_scale", "action_offset", "checkpoint_sha256", "checkpoint_epoch")
 DEF_EXPORTER = "~/hyeonseok/Untitled Folder/export_so101_pick_v1.py"
 DEF_UMI = "~/hyeonseok/umi_gpu_bundle/third_party/umi"
-# 상대 액션이면 청크 안 이동이 이 안쪽이어야 한다. 넘으면 절대 좌표를 의심한다.
-REL_POS_MAX_MM = 300.0
 
 
 def sha256(p: Path) -> str:
@@ -71,8 +69,25 @@ def run(cmd, cwd=None, title=None) -> int:
     return p.returncode
 
 
-def action_scale_report(out: Path) -> dict:
-    """reference.npz 의 액션 규모. 상대인지 절대인지의 유일한 실측 단서다."""
+REF_KEYS = ("sample", "timestep", "condition", "expected_encoder", "expected_denoiser")
+
+
+def reference_report(out: Path) -> dict:
+    """What reference.npz actually holds. 실제로 뭐가 들어있는지.
+
+    ⚠️ 2026-09-21 정정 — 초판은 여기서 **액션 규모(상대/절대)를 재려 했다. 틀렸다.**
+    `sample` 은 diffusion 입력 **랜덤 노이즈**이고 `expected_denoiser` 는 예측된
+    **epsilon** 이다 (`prediction_type: epsilon`). 액션이 아니다.
+    첫 번째 (*,10) 배열을 액션이라고 단정해서 노이즈를 미터로 읽고 1926.9mm 를
+    불합격으로 냈다. **뜻을 모르는 값에 게이트를 걸면 이렇게 된다.**
+
+    이 파일의 용도는 하나다 — 젯슨에서 TorchScript 출력이 PC 와 같은지 대조하는
+    기준값. 그래서 여기서는 **그 기준값이 온전한지**만 본다.
+
+    액션 규모는 정책을 실제로 돌려야 나온다 (`smoke_deploy_ckpt` 단계 1).
+    🟢 2026-09-21 우리 배포본에서 최대 96.5mm — 절대 좌표(x 0.13~0.43)가 아니라
+    상대다. 그 근거는 여기가 아니라 거기에 있다.
+    """
     try:
         import numpy as np
     except ImportError:
@@ -83,22 +98,20 @@ def action_scale_report(out: Path) -> dict:
     try:
         z = np.load(p, allow_pickle=False)
     except Exception as exc:                      # noqa: BLE001
-        # 못 읽은 것과 규모가 괜찮은 것을 가른다. 조용히 통과시키지 않는다
-        return {"ok": None, "why": f"reference.npz 를 못 읽었다 ({type(exc).__name__}) — 대조 불가"}
-    best = None
-    for k in z:
-        a = z[k]
-        if a.ndim >= 2 and a.shape[-1] == 10:
-            best = (k, a.reshape(-1, 10))
-            break
-    if best is None:
-        return {"ok": None, "why": f"(*,10) 배열이 없다. 키 {list(z)} — 대조 불가"}
-    k, x = best
-    mm = float(abs(x[:, :3]).max()) * 1000.0
-    return {"ok": mm <= REL_POS_MAX_MM, "key": k, "pos_abs_max_mm": mm,
-            "gap_min_m": float(x[:, 9].min()), "gap_max_m": float(x[:, 9].max()),
-            "why": (f"pos |최대| {mm:.1f} mm (기준 <= {REL_POS_MAX_MM}). "
-                    "넘으면 절대 좌표일 수 있다 — 실행기가 상대로 읽으면 틀린다")}
+        return {"ok": None, "why": f"못 읽었다 ({type(exc).__name__}) — 대조 불가"}
+    keys = list(z)
+    miss = [k for k in REF_KEYS if k not in keys]
+    bad = [k for k in REF_KEYS if k in keys and not np.isfinite(z[k]).all()]
+    shapes = {k: list(z[k].shape) for k in REF_KEYS if k in keys}
+    same = ("expected_denoiser" in shapes and "sample" in shapes
+            and shapes["expected_denoiser"] == shapes["sample"])
+    return {"ok": not miss and not bad and same,
+            "keys": len(keys), "shapes": shapes,
+            "why": (f"기준값 {len(REF_KEYS) - len(miss)} / {len(REF_KEYS)}"
+                    + (f" · 없음 {miss}" if miss else "")
+                    + (f" · NaN/Inf {bad}" if bad else "")
+                    + ("" if same else " · denoiser 출력과 sample 모양이 다르다")),
+            "note": "액션 규모는 여기서 못 잰다. smoke_deploy_ckpt 단계 1 로 잰다"}
 
 
 def verify(out: Path, archive: Path | None) -> dict:
@@ -159,8 +172,8 @@ def verify(out: Path, archive: Path | None) -> dict:
                      ("camera_tcp 해시 기록", "있을 것")):
             row(n, None, "dataset.report.json 없음 — 대조 불가", w)
 
-    a = action_scale_report(out)
-    row("액션 규모 (상대 여부)", a.get("ok"), a.get("why"), f"pos <= {REL_POS_MAX_MM} mm")
+    a = reference_report(out)
+    row("TorchScript 기준값 온전", a.get("ok"), a.get("why"), "5종 전부 · NaN/Inf 없음")
 
     if archive is not None:
         row("tgz 생성", archive.exists(),
@@ -170,7 +183,7 @@ def verify(out: Path, archive: Path | None) -> dict:
     u = sum(1 for r in rows if r["ok"] is None)
     return {"rows": rows, "passed": p, "failed": f, "unknown": u, "total": len(rows),
             "verdict": "PASS" if f == 0 and u == 0 else ("FAIL" if f else "INCOMPLETE"),
-            "action_scale": a,
+            "reference": a,
             "note": "변환 성공은 실물 작업 성공률이 아니다"}
 
 
@@ -343,25 +356,30 @@ def selftest() -> int:
             import numpy as np
             npz = root / "npz"
             npz.mkdir()
-            for n in ("encoder.pt", "denoiser.pt", "config.yaml"):
-                (npz / n).write_text("x")
-            (npz / "metadata.json").write_text(json.dumps(good_meta))
-            (npz / "dataset.report.json").write_text(json.dumps(good_rep))
-            (npz / "pc_check.json").write_text(json.dumps({"status": "PASS",
-                                                           "pc_inference_ms": 1.0}))
-            rel = np.zeros((1, 16, 10), dtype=np.float32); rel[..., :3] = 0.05
-            np.savez(npz / "reference.npz", action=rel)
-            chk("7 상대 규모(50mm) -> 통과 (정답 아는 행)",
-                action_scale_report(npz)["ok"] is True,
-                f"{action_scale_report(npz)['pos_abs_max_mm']:.1f} mm")
-            rel[..., :3] = 0.43
-            np.savez(npz / "reference.npz", action=rel)
-            chk("8 절대 규모(430mm) -> 불합격 (판별행)",
-                action_scale_report(npz)["ok"] is False,
-                f"{action_scale_report(npz)['pos_abs_max_mm']:.1f} mm")
+            def _ref(**kw):
+                np.savez(npz / "reference.npz", **kw)
+            ok_kw = dict(sample=np.zeros((1, 16, 10), np.float32),
+                         timestep=np.array(25), condition=np.zeros((1, 1056), np.float32),
+                         expected_encoder=np.zeros((1, 1056), np.float32),
+                         expected_denoiser=np.zeros((1, 16, 10), np.float32))
+            _ref(**ok_kw)
+            chk("7 기준값 5종 온전 -> 통과 (정답 아는 행)",
+                reference_report(npz)["ok"] is True, reference_report(npz)["why"])
+            bad = dict(ok_kw); bad.pop("expected_denoiser")
+            _ref(**bad)
+            chk("8 기준값 하나 없음 -> 불합격 (판별행)",
+                reference_report(npz)["ok"] is False, reference_report(npz)["why"])
+            nan = dict(ok_kw); nan["expected_encoder"] = np.full((1, 1056), np.nan, np.float32)
+            _ref(**nan)
+            chk("9 NaN 섞임 -> 불합격 (판별행)", reference_report(npz)["ok"] is False,
+                reference_report(npz)["why"])
+            shp = dict(ok_kw); shp["expected_denoiser"] = np.zeros((1, 8, 10), np.float32)
+            _ref(**shp)
+            chk("10 denoiser 모양 불일치 -> 불합격 (판별행)",
+                reference_report(npz)["ok"] is False, reference_report(npz)["why"][-30:])
         except ImportError:
             chk("7 numpy 없음 -> 미판정 (통과 아님)",
-                action_scale_report(root / "full")["ok"] is None)
+                reference_report(root / "full")["ok"] is None)
 
     print(f"\n자체검증 {ok}/{tot}")
     return 0 if ok == tot else 1
