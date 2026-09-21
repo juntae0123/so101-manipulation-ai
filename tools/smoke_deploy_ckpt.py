@@ -231,7 +231,10 @@ def stage1(ctx: dict) -> tuple[int, int]:
     # ⚠️ 2026-09-21 — (8,10) 을 리터럴로 박아 현석 e120 ckpt(16,10)를 헛불합격시켰다.
     #    horizon 은 매니페스트에서 받는다. 못 받으면 **미판정**이지 통과가 아니다 (D-AI-81).
     _h = ((ctx or {}).get("manifest") or {}).get("actionSpec", {}).get("horizon")
-    _d = ((ctx or {}).get("manifest") or {}).get("actionSpec", {}).get("dim") or 10
+    # ⚠️ actionSpec.dim 은 **리스트** [10] 다 (shape_meta.action.shape 그대로). 2026-09-21
+    _draw = ((ctx or {}).get("manifest") or {}).get("actionSpec", {}).get("dim")
+    _d = int(_draw[-1]) if isinstance(_draw, (list, tuple)) and _draw else (
+        int(_draw) if isinstance(_draw, int) else 10)
     if _h is None:
         check("출력 모양 (horizon, dim)", None,
               f"{act.shape} / 매니페스트에 actionSpec.horizon 이 없다 — 대조 불가는 통과가 아니다")
@@ -330,6 +333,14 @@ def selftest() -> int:
     check("배포 매니페스트 -> 전부 읽힘 (정답 아는 행)",
           len(_e2) == len(CONTRACT_KEYS) and _m2 == [],
           f"읽힘 {len(_e2)} / {len(CONTRACT_KEYS)}")
+    def _dim(raw):
+        return int(raw[-1]) if isinstance(raw, (list, tuple)) and raw else (
+            int(raw) if isinstance(raw, int) else 10)
+    check("dim 이 [10] 이든 10 이든 10 으로 읽힌다 (정답 아는 행)",
+          _dim([10]) == 10 and _dim(10) == 10 and _dim(None) == 10,
+          f"[10]->{_dim([10])} · 10->{_dim(10)} · None->{_dim(None)}")
+    check("dim [7] 은 7 로 읽힌다 (판별행)", _dim([7]) == 7, f"[7]->{_dim([7])}")
+
     _e3, _m3 = manifest_contract({"actionSpec": {"horizon": 16}})
     check("일부만 있는 매니페스트 -> 부분 보고 (판별행)",
           len(_e3) == 1 and len(_m3) == len(CONTRACT_KEYS) - 1,
